@@ -87,6 +87,14 @@ class FetchNode(BaseNode):
             None if node_config is None else node_config.get("storage_state", None)
         )
 
+        # Browser pool configuration
+        self.use_pool = (
+            True if node_config is None else node_config.get("use_pool", True)
+        )
+        self.pool_config = (
+            None if node_config is None else node_config.get("pool_config", None)
+        )
+
     def execute(self, state):
         """
         Executes the node's logic to fetch HTML content from a specified URL and
@@ -352,6 +360,12 @@ class FetchNode(BaseNode):
 
                 document = [Document(page_content=data, metadata={"source": source})]
             else:
+                # Add pool configuration to loader kwargs if not already present
+                if "use_pool" not in loader_kwargs:
+                    loader_kwargs["use_pool"] = self.use_pool
+                if "pool_config" not in loader_kwargs and self.pool_config is not None:
+                    loader_kwargs["pool_config"] = self.pool_config
+
                 loader = ChromiumLoader(
                     [source],
                     headless=self.headless,

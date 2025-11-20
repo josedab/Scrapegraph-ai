@@ -37,6 +37,8 @@ class ChromiumLoader(BaseLoader):
         browser_name: str = "chromium",  # default chromium
         retry_limit: int = 1,
         timeout: int = 60,
+        use_pool: bool = True,  # Enable pooling by default
+        pool_config: Optional[dict] = None,  # Custom pool configuration
         **kwargs: Any,
     ):
         """Initialize the loader with a list of URL paths.
@@ -49,6 +51,8 @@ class ChromiumLoader(BaseLoader):
             requires_js_support: Whether to use JS rendering for scraping.
             retry_limit: Maximum number of retry attempts for scraping. Defaults to 3.
             timeout: Maximum time in seconds to wait for scraping. Defaults to 10.
+            use_pool: Whether to use browser connection pooling. Defaults to True.
+            pool_config: Optional custom configuration for the browser pool.
             kwargs: A dictionary containing additional browser kwargs.
 
         Raises:
@@ -72,6 +76,8 @@ class ChromiumLoader(BaseLoader):
         self.browser_name = kwargs.get("browser_name", browser_name)
         self.retry_limit = kwargs.get("retry_limit", retry_limit)
         self.timeout = kwargs.get("timeout", timeout)
+        self.use_pool = use_pool
+        self.pool_config = pool_config
 
     async def scrape(self, url: str) -> str:
         if self.backend == "playwright":
@@ -232,81 +238,163 @@ class ChromiumLoader(BaseLoader):
         attempt = 0
 
         while attempt < self.retry_limit:
+            browser = None
             try:
-                async with async_playwright() as p:
-                    browser = None
-                    if browser_name == "chromium":
-                        browser = await p.chromium.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    elif browser_name == "firefox":
-                        browser = await p.firefox.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    else:
-                        raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context()
-                    await Malenia.apply_stealth(context)
-                    page = await context.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
-                    await page.wait_for_load_state(self.load_state)
+                if self.use_pool and self.backend == "playwright":
+                    # Use pooled browser
+                    from ..utils.browser_pool import BrowserPoolManager, PoolConfig
 
-                    previous_height = None
-                    start_time = time.time()
+                    # Create pool config
+                    pool_config = None
+                    if self.pool_config:
+                        pool_config = PoolConfig.from_dict(self.pool_config)
 
-                    # Store the heights of the page after each scroll
-                    # This is useful in case we scroll with a timer and want to stop shortly after reaching the bottom
-                    # or simly when the page stops changing for some reason.
-                    heights = []
+                    browser, context = await BrowserPoolManager.acquire_context(
+                        config=pool_config,
+                        stealth=True,
+                        storage_state=self.storage_state,
+                    )
 
-                    while True:
-                        current_height = await page.evaluate(
-                            "document.body.scrollHeight"
-                        )
-                        heights.append(current_height)
-                        heights = heights[
-                            -5:
-                        ]  # Keep only the last 5 heights, to not run out of memory
+                    try:
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded")
+                        await page.wait_for_load_state(self.load_state)
 
-                        # Break if we've reached the bottom of the page i.e. if scrolling makes no more progress
-                        # Attention!!! This is not always reliable. Sometimes the page might not change due to lazy loading
-                        # or other reasons. In such cases, the user should set scroll_to_bottom=False and set a timeout.
-                        if scroll_to_bottom and previous_height == current_height:
-                            logger.info(f"Reached bottom of page for url {url}")
-                            break
+                        previous_height = None
+                        start_time = time.time()
 
-                        previous_height = current_height
+                        # Store the heights of the page after each scroll
+                        # This is useful in case we scroll with a timer and want to stop shortly after reaching the bottom
+                        # or simly when the page stops changing for some reason.
+                        heights = []
 
-                        await page.mouse.wheel(0, scroll)
-                        logger.debug(
-                            f"Scrolled {url} to current height {current_height}px..."
-                        )
-                        time.sleep(
-                            sleep
-                        )  # Allow some time for any lazy-loaded content to load
+                        while True:
+                            current_height = await page.evaluate(
+                                "document.body.scrollHeight"
+                            )
+                            heights.append(current_height)
+                            heights = heights[
+                                -5:
+                            ]  # Keep only the last 5 heights, to not run out of memory
 
-                        current_time = time.time()
-                        elapsed_time = current_time - start_time
-                        logger.debug(f"Elapsed time: {elapsed_time} seconds")
-
-                        if timeout:
-                            if elapsed_time >= timeout:
-                                logger.info(
-                                    f"Reached timeout of {timeout} seconds for url {url}"
-                                )
-                                break
-                            elif len(heights) == 5 and len(set(heights)) == 1:
-                                logger.info(
-                                    f"Page height has not changed for url {url} for the last 5 scrolls. Stopping."
-                                )
+                            # Break if we've reached the bottom of the page i.e. if scrolling makes no more progress
+                            # Attention!!! This is not always reliable. Sometimes the page might not change due to lazy loading
+                            # or other reasons. In such cases, the user should set scroll_to_bottom=False and set a timeout.
+                            if scroll_to_bottom and previous_height == current_height:
+                                logger.info(f"Reached bottom of page for url {url}")
                                 break
 
-                    results = await page.content()
-                    break
+                            previous_height = current_height
+
+                            await page.mouse.wheel(0, scroll)
+                            logger.debug(
+                                f"Scrolled {url} to current height {current_height}px..."
+                            )
+                            time.sleep(
+                                sleep
+                            )  # Allow some time for any lazy-loaded content to load
+
+                            current_time = time.time()
+                            elapsed_time = current_time - start_time
+                            logger.debug(f"Elapsed time: {elapsed_time} seconds")
+
+                            if timeout:
+                                if elapsed_time >= timeout:
+                                    logger.info(
+                                        f"Reached timeout of {timeout} seconds for url {url}"
+                                    )
+                                    break
+                                elif len(heights) == 5 and len(set(heights)) == 1:
+                                    logger.info(
+                                        f"Page height has not changed for url {url} for the last 5 scrolls. Stopping."
+                                    )
+                                    break
+
+                        results = await page.content()
+                        logger.info("Content scraped with scrolling (pooled browser)")
+                        break
+                    finally:
+                        await page.close()
+                        # Release context back to pool
+                        await BrowserPoolManager.release_context(
+                            browser, context, close_context=True
+                        )
+                else:
+                    # Fallback to original behavior
+                    async with async_playwright() as p:
+                        if browser_name == "chromium":
+                            browser = await p.chromium.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        elif browser_name == "firefox":
+                            browser = await p.firefox.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        else:
+                            raise ValueError(f"Invalid browser name: {browser_name}")
+                        context = await browser.new_context()
+                        await Malenia.apply_stealth(context)
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded")
+                        await page.wait_for_load_state(self.load_state)
+
+                        previous_height = None
+                        start_time = time.time()
+
+                        # Store the heights of the page after each scroll
+                        # This is useful in case we scroll with a timer and want to stop shortly after reaching the bottom
+                        # or simly when the page stops changing for some reason.
+                        heights = []
+
+                        while True:
+                            current_height = await page.evaluate(
+                                "document.body.scrollHeight"
+                            )
+                            heights.append(current_height)
+                            heights = heights[
+                                -5:
+                            ]  # Keep only the last 5 heights, to not run out of memory
+
+                            # Break if we've reached the bottom of the page i.e. if scrolling makes no more progress
+                            # Attention!!! This is not always reliable. Sometimes the page might not change due to lazy loading
+                            # or other reasons. In such cases, the user should set scroll_to_bottom=False and set a timeout.
+                            if scroll_to_bottom and previous_height == current_height:
+                                logger.info(f"Reached bottom of page for url {url}")
+                                break
+
+                            previous_height = current_height
+
+                            await page.mouse.wheel(0, scroll)
+                            logger.debug(
+                                f"Scrolled {url} to current height {current_height}px..."
+                            )
+                            time.sleep(
+                                sleep
+                            )  # Allow some time for any lazy-loaded content to load
+
+                            current_time = time.time()
+                            elapsed_time = current_time - start_time
+                            logger.debug(f"Elapsed time: {elapsed_time} seconds")
+
+                            if timeout:
+                                if elapsed_time >= timeout:
+                                    logger.info(
+                                        f"Reached timeout of {timeout} seconds for url {url}"
+                                    )
+                                    break
+                                elif len(heights) == 5 and len(set(heights)) == 1:
+                                    logger.info(
+                                        f"Page height has not changed for url {url} for the last 5 scrolls. Stopping."
+                                    )
+                                    break
+
+                        results = await page.content()
+                        await browser.close()
+                        break
 
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
@@ -315,8 +403,6 @@ class ChromiumLoader(BaseLoader):
                     results = (
                         f"Error: Network error after {self.retry_limit} attempts - {e}"
                     )
-            finally:
-                await browser.close()
 
         return results
 
@@ -343,34 +429,65 @@ class ChromiumLoader(BaseLoader):
 
         while attempt < self.retry_limit:
             try:
-                async with async_playwright() as p, async_timeout.timeout(self.timeout):
-                    browser = None
-                    if browser_name == "chromium":
-                        browser = await p.chromium.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    elif browser_name == "firefox":
-                        browser = await p.firefox.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    else:
-                        raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context(
+                if self.use_pool and self.backend == "playwright":
+                    # Use pooled browser
+                    from ..utils.browser_pool import BrowserPoolManager, PoolConfig
+
+                    # Create pool config
+                    pool_config = None
+                    if self.pool_config:
+                        pool_config = PoolConfig.from_dict(self.pool_config)
+
+                    browser, context = await BrowserPoolManager.acquire_context(
+                        config=pool_config,
+                        stealth=True,
                         storage_state=self.storage_state,
-                        ignore_https_errors=True,
                     )
-                    await Malenia.apply_stealth(context)
-                    page = await context.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
-                    await page.wait_for_load_state(self.load_state)
-                    results = await page.content()
-                    logger.info("Content scraped")
-                    await browser.close()
-                    return results
+
+                    try:
+                        async with async_timeout.timeout(self.timeout):
+                            page = await context.new_page()
+                            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+                            await page.wait_for_load_state(self.load_state)
+                            results = await page.content()
+                            logger.info("Content scraped using pooled browser")
+                            return results
+                    finally:
+                        await page.close()
+                        # Release context back to pool (keep context open for reuse)
+                        await BrowserPoolManager.release_context(
+                            browser, context, close_context=True
+                        )
+                else:
+                    # Fallback to original behavior
+                    async with async_playwright() as p, async_timeout.timeout(self.timeout):
+                        browser = None
+                        if browser_name == "chromium":
+                            browser = await p.chromium.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        elif browser_name == "firefox":
+                            browser = await p.firefox.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        else:
+                            raise ValueError(f"Invalid browser name: {browser_name}")
+                        context = await browser.new_context(
+                            storage_state=self.storage_state,
+                            ignore_https_errors=True,
+                        )
+                        await Malenia.apply_stealth(context)
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded")
+                        await page.wait_for_load_state(self.load_state)
+                        results = await page.content()
+                        logger.info("Content scraped")
+                        await browser.close()
+                        return results
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
                 logger.error(f"Attempt {attempt} failed: {e}")
@@ -401,31 +518,62 @@ class ChromiumLoader(BaseLoader):
         attempt = 0
 
         while attempt < self.retry_limit:
+            browser = None
             try:
-                async with async_playwright() as p, async_timeout.timeout(self.timeout):
-                    browser = None
-                    if browser_name == "chromium":
-                        browser = await p.chromium.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    elif browser_name == "firefox":
-                        browser = await p.firefox.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
-                        )
-                    else:
-                        raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context(
-                        storage_state=self.storage_state
+                if self.use_pool and self.backend == "playwright":
+                    # Use pooled browser
+                    from ..utils.browser_pool import BrowserPoolManager, PoolConfig
+
+                    # Create pool config
+                    pool_config = None
+                    if self.pool_config:
+                        pool_config = PoolConfig.from_dict(self.pool_config)
+
+                    browser, context = await BrowserPoolManager.acquire_context(
+                        config=pool_config,
+                        stealth=False,  # No stealth for JS support
+                        storage_state=self.storage_state,
                     )
-                    page = await context.new_page()
-                    await page.goto(url, wait_until="networkidle")
-                    results = await page.content()
-                    logger.info("Content scraped after JavaScript rendering")
-                    return results
+
+                    try:
+                        async with async_timeout.timeout(self.timeout):
+                            page = await context.new_page()
+                            await page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
+                            results = await page.content()
+                            logger.info("Content scraped after JavaScript rendering (pooled browser)")
+                            return results
+                    finally:
+                        await page.close()
+                        # Release context back to pool
+                        await BrowserPoolManager.release_context(
+                            browser, context, close_context=True
+                        )
+                else:
+                    # Fallback to original behavior
+                    async with async_playwright() as p, async_timeout.timeout(self.timeout):
+                        if browser_name == "chromium":
+                            browser = await p.chromium.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        elif browser_name == "firefox":
+                            browser = await p.firefox.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        else:
+                            raise ValueError(f"Invalid browser name: {browser_name}")
+                        context = await browser.new_context(
+                            storage_state=self.storage_state
+                        )
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="networkidle")
+                        results = await page.content()
+                        logger.info("Content scraped after JavaScript rendering")
+                        await browser.close()
+                        return results
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
                 logger.error(f"Attempt {attempt} failed: {e}")
@@ -433,8 +581,6 @@ class ChromiumLoader(BaseLoader):
                     raise RuntimeError(
                         f"Failed to scrape after {self.retry_limit} attempts: {str(e)}"
                     )
-            finally:
-                await browser.close()
 
     def lazy_load(self) -> Iterator[Document]:
         """
