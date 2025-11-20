@@ -3,14 +3,22 @@ base_graph module
 """
 
 import time
+import uuid
 import warnings
 from typing import Tuple
 
 from ..telemetry import log_graph_execution
 from ..utils import CustomLLMCallbackManager
-from ..utils.logging import get_logger
+from ..utils.logging import (
+    get_logger,
+    get_structured_logger,
+    set_correlation_id,
+    get_correlation_id,
+    log_execution_time,
+)
 
 logger = get_logger(__name__)
+structured_logger = get_structured_logger(__name__)
 
 # ANSI escape sequence for hyperlink
 CLICKABLE_URL = "\033]8;;https://scrapegraphai.com\033\\https://scrapegraphai.com\033]8;;\033\\"
@@ -197,6 +205,14 @@ class BaseGraph:
 
     def _execute_node(self, current_node, state, llm_model, llm_model_name):
         """Executes a single node and returns execution information."""
+        # Log node execution start
+        structured_logger.info(
+            "Executing node",
+            node_name=current_node.node_name,
+            node_type=current_node.node_type,
+            correlation_id=get_correlation_id(),
+        )
+
         curr_time = time.time()
 
         with self.callback_manager.exclusive_get_callback(
@@ -216,6 +232,26 @@ class BaseGraph:
                     "total_cost_USD": cb.total_cost,
                     "exec_time": node_exec_time,
                 }
+
+                # Log node execution completion with LLM metrics
+                structured_logger.info(
+                    "Node execution completed",
+                    node_name=current_node.node_name,
+                    node_type=current_node.node_type,
+                    duration_ms=round(node_exec_time * 1000, 2),
+                    total_tokens=cb.total_tokens,
+                    total_cost_usd=cb.total_cost,
+                    correlation_id=get_correlation_id(),
+                )
+            else:
+                # Log node execution completion without LLM metrics
+                structured_logger.info(
+                    "Node execution completed",
+                    node_name=current_node.node_name,
+                    node_type=current_node.node_type,
+                    duration_ms=round(node_exec_time * 1000, 2),
+                    correlation_id=get_correlation_id(),
+                )
 
         return result, node_exec_time, cb_data
 
@@ -293,6 +329,19 @@ class BaseGraph:
             except Exception as e:
                 error_node = current_node.node_name
                 graph_execution_time = time.time() - start_time
+
+                # Log error with structured logging
+                structured_logger.error(
+                    "Graph execution failed",
+                    graph_name=self.graph_name,
+                    error_node=error_node,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    execution_time_sec=round(graph_execution_time, 2),
+                    correlation_id=get_correlation_id(),
+                    exc_info=True,
+                )
+
                 log_graph_execution(
                     graph_name=self.graph_name,
                     source=source,
@@ -351,16 +400,44 @@ class BaseGraph:
         Returns:
             Tuple[dict, list]: A tuple containing the final state and a list of execution info.
         """
+        # Set correlation ID if not already set
+        if get_correlation_id() is None or get_correlation_id() == "":
+            correlation_id = str(uuid.uuid4())
+            set_correlation_id(correlation_id)
+        else:
+            correlation_id = get_correlation_id()
+
+        # Log graph execution start with structured logging
+        structured_logger.info(
+            "Starting graph execution",
+            graph_name=self.graph_name,
+            correlation_id=correlation_id,
+            entry_point=self.entry_point,
+            use_burr=self.use_burr,
+        )
 
         self.initial_state = initial_state
         if self.use_burr:
             from ..integrations import BurrBridge
 
             bridge = BurrBridge(self, self.burr_config)
-            result = bridge.execute(initial_state)
-            state, exec_info = (result["_state"], [])
+
+            with log_execution_time(
+                structured_logger,
+                "graph_execution_burr",
+                graph_name=self.graph_name,
+                correlation_id=correlation_id,
+            ):
+                result = bridge.execute(initial_state)
+                state, exec_info = (result["_state"], [])
         else:
-            state, exec_info = self._execute_standard(initial_state)
+            with log_execution_time(
+                structured_logger,
+                "graph_execution_standard",
+                graph_name=self.graph_name,
+                correlation_id=correlation_id,
+            ):
+                state, exec_info = self._execute_standard(initial_state)
 
         # Print the result first
         if "answer" in state:

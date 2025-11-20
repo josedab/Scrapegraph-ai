@@ -38,6 +38,18 @@ from .logging import (
     unset_propagation,
     unsetDEFAULT_HANDLER,
     warning_once,
+    # Structured logging
+    get_structured_logger,
+    get_correlation_id,
+    set_correlation_id,
+    clear_correlation_id,
+    log_execution_time,
+    configure_logging,
+    LogConfig,
+    LogFormat,
+    JSONFormatter,
+    DevelopmentFormatter,
+    StructuredLogger,
 )
 from .prettify_exec_info import prettify_exec_info
 from .proxy_rotation import Proxy, parse_or_search_proxy, search_proxy_servers
@@ -114,4 +126,16 @@ __all__ = [
     "set_formatting",
     "unset_formatting",
     "warning_once",
+    # Structured logging
+    "get_structured_logger",
+    "get_correlation_id",
+    "set_correlation_id",
+    "clear_correlation_id",
+    "log_execution_time",
+    "configure_logging",
+    "LogConfig",
+    "LogFormat",
+    "JSONFormatter",
+    "DevelopmentFormatter",
+    "StructuredLogger",
 ]

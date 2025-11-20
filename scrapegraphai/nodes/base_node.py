@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 from ..utils import get_logger
+from ..utils.logging import get_structured_logger, get_correlation_id
 
 
 class BaseNode(ABC):
@@ -17,10 +18,12 @@ class BaseNode(ABC):
     Attributes:
         node_name (str): The unique identifier name for the node.
         input (str): Boolean expression defining the input keys needed from the state.
-        output (List[str]): List of
+        output (List[str]): List of output keys to be updated in the state.
         min_input_len (int): Minimum required number of input keys.
         node_config (Optional[dict]): Additional configuration for the node.
-        logger (logging.Logger): The centralized root logger
+        logger (logging.Logger): The centralized root logger.
+        structured_logger (StructuredLogger): Logger with structured logging support
+                                              for production debugging and observability.
 
     Args:
         node_name (str): Name for identifying the node.
@@ -37,7 +40,15 @@ class BaseNode(ABC):
     Example:
         >>> class MyNode(BaseNode):
         ...     def execute(self, state):
-        ...         # Implementation of node logic here
+        ...         # Basic logging (backward compatible)
+        ...         self.logger.info("Processing data")
+        ...
+        ...         # Structured logging with context (recommended)
+        ...         self.structured_logger.info(
+        ...             "Processing data",
+        ...             node_name=self.node_name,
+        ...             record_count=len(data)
+        ...         )
         ...         return state
         ...
         >>> my_node = MyNode("ExampleNode", "node", "input_spec", ["output_spec"])
@@ -60,6 +71,7 @@ class BaseNode(ABC):
         self.min_input_len = min_input_len
         self.node_config = node_config
         self.logger = get_logger()
+        self.structured_logger = get_structured_logger(self.__class__.__name__)
 
         if node_type not in ["node", "conditional_node"]:
             raise ValueError(
