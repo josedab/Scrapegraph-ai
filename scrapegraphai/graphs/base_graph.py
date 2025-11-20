@@ -4,11 +4,16 @@ base_graph module
 
 import time
 import warnings
-from typing import Tuple
+from typing import Tuple, Optional
 
 from ..telemetry import log_graph_execution
 from ..utils import CustomLLMCallbackManager
 from ..utils.logging import get_logger
+from ..cost_management import (
+    CostTracker,
+    BudgetEnforcer,
+    extract_attribution_from_state,
+)
 
 logger = get_logger(__name__)
 
@@ -61,6 +66,8 @@ class BaseGraph:
         use_burr: bool = False,
         burr_config: dict = None,
         graph_name: str = "Custom",
+        cost_tracker: Optional[CostTracker] = None,
+        budget_enforcer: Optional[BudgetEnforcer] = None,
     ):
         self.nodes = nodes
         self.raw_edges = edges
@@ -69,6 +76,8 @@ class BaseGraph:
         self.graph_name = graph_name
         self.initial_state = {}
         self.callback_manager = CustomLLMCallbackManager()
+        self.cost_tracker = cost_tracker
+        self.budget_enforcer = budget_enforcer
 
         if nodes[0].node_name != entry_point.node_name:
             warnings.warn(
@@ -261,6 +270,21 @@ class BaseGraph:
         prompt = None
         schema = None
 
+        # Extract attribution context if present
+        attribution = extract_attribution_from_state(state)
+
+        # Check budget before execution if budget enforcer is enabled
+        if attribution and self.budget_enforcer:
+            try:
+                budget_check = self.budget_enforcer.check_budget_before_execution(
+                    attribution, estimated_cost=0.0
+                )
+                logger.debug(f"Budget check passed: {budget_check}")
+            except Exception as e:
+                # Budget exceeded, log and re-raise
+                logger.error(f"Budget check failed: {e}")
+                raise
+
         while current_node_name:
             current_node = self._get_node_by_name(current_node_name)
 
@@ -287,6 +311,28 @@ class BaseGraph:
                     exec_info.append(cb_data)
                     for key in cb_total:
                         cb_total[key] += cb_data[key]
+
+                    # Track costs with attribution if enabled
+                    if attribution and self.cost_tracker and cb_data.get("total_cost_USD", 0) > 0:
+                        try:
+                            self.cost_tracker.track_cost(
+                                attribution=attribution,
+                                node_name=cb_data.get("node_name", "unknown"),
+                                model_name=llm_model_name or "unknown",
+                                total_tokens=cb_data.get("total_tokens", 0),
+                                prompt_tokens=cb_data.get("prompt_tokens", 0),
+                                completion_tokens=cb_data.get("completion_tokens", 0),
+                                total_cost_usd=cb_data.get("total_cost_USD", 0.0),
+                                execution_time=node_exec_time,
+                            )
+
+                            # Check and trigger alerts
+                            if self.budget_enforcer:
+                                self.budget_enforcer.check_and_alert(
+                                    attribution, cb_data.get("total_cost_USD", 0.0)
+                                )
+                        except Exception as e:
+                            logger.warning(f"Cost tracking failed: {e}")
 
                 current_node_name = self._get_next_node(current_node, result)
 
