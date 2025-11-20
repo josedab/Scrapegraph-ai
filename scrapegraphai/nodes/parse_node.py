@@ -59,6 +59,12 @@ class ParseNode(BaseNode):
         self.llm_model = node_config.get("llm_model")
         self.chunk_size = node_config.get("chunk_size")
 
+        # Enhanced chunking configuration
+        self.chunk_overlap_percentage = node_config.get("chunk_overlap_percentage", 0.1)
+        self.chunk_overlap_size = node_config.get("chunk_overlap_size", None)
+        self.chunk_strategy = node_config.get("chunk_strategy", "semantic")
+        self.preserve_boundaries = node_config.get("preserve_boundaries", True)
+
     def execute(self, state: dict) -> dict:
         """
         Executes the node's logic to parse the HTML document content and split it into chunks.
@@ -95,6 +101,10 @@ class ParseNode(BaseNode):
             chunks = split_text_into_chunks(
                 text=docs_transformed.page_content,
                 chunk_size=self.chunk_size - 250,
+                overlap_size=self.chunk_overlap_size,
+                overlap_percentage=self.chunk_overlap_percentage,
+                strategy=self.chunk_strategy,
+                preserve_boundaries=self.preserve_boundaries,
             )
         else:
             docs_transformed = docs_transformed[0]
@@ -113,10 +123,19 @@ class ParseNode(BaseNode):
                 chunks = split_text_into_chunks(
                     text=docs_transformed.page_content,
                     chunk_size=chunk_size,
+                    overlap_size=self.chunk_overlap_size,
+                    overlap_percentage=self.chunk_overlap_percentage,
+                    strategy=self.chunk_strategy,
+                    preserve_boundaries=self.preserve_boundaries,
                 )
             else:
                 chunks = split_text_into_chunks(
-                    text=docs_transformed, chunk_size=chunk_size
+                    text=docs_transformed,
+                    chunk_size=chunk_size,
+                    overlap_size=self.chunk_overlap_size,
+                    overlap_percentage=self.chunk_overlap_percentage,
+                    strategy=self.chunk_strategy,
+                    preserve_boundaries=self.preserve_boundaries,
                 )
 
         state.update({self.output[0]: chunks})
