@@ -37,6 +37,12 @@ class ChromiumLoader(BaseLoader):
         browser_name: str = "chromium",  # default chromium
         retry_limit: int = 1,
         timeout: int = 60,
+        # Rate limiting parameters
+        enable_rate_limiting: bool = True,
+        rate_limit_config: Optional[dict] = None,
+        # Anti-bot parameters
+        enable_anti_bot: bool = True,
+        anti_bot_config: Optional[dict] = None,
         **kwargs: Any,
     ):
         """Initialize the loader with a list of URL paths.
@@ -47,12 +53,21 @@ class ChromiumLoader(BaseLoader):
             proxy: A dictionary containing proxy information; None disables protection.
             urls: A list of URLs to scrape content from.
             requires_js_support: Whether to use JS rendering for scraping.
-            retry_limit: Maximum number of retry attempts for scraping. Defaults to 3.
-            timeout: Maximum time in seconds to wait for scraping. Defaults to 10.
+            retry_limit: Maximum number of retry attempts for scraping. Defaults to 1.
+            timeout: Maximum time in seconds to wait for scraping. Defaults to 60.
+            enable_rate_limiting: Enable per-domain rate limiting. Defaults to True.
+            rate_limit_config: Configuration dict for rate limiting. Optional.
+            enable_anti_bot: Enable anti-bot evasion features. Defaults to True.
+            anti_bot_config: Configuration dict for anti-bot features. Optional.
             kwargs: A dictionary containing additional browser kwargs.
 
         Raises:
             ImportError: If the required backend package is not installed.
+
+        Note:
+            Rate limiting and anti-bot features are enabled by default to improve
+            scraping reliability and avoid being blocked. See the documentation at
+            docs/rate_limiting_and_anti_bot.md for configuration options.
         """
         message = (
             f"{backend} is required for ChromiumLoader. "
@@ -72,6 +87,26 @@ class ChromiumLoader(BaseLoader):
         self.browser_name = kwargs.get("browser_name", browser_name)
         self.retry_limit = kwargs.get("retry_limit", retry_limit)
         self.timeout = kwargs.get("timeout", timeout)
+        self.enable_rate_limiting = enable_rate_limiting
+        self.enable_anti_bot = enable_anti_bot
+
+        # Initialize rate limiter
+        if self.enable_rate_limiting:
+            from ..utils.rate_limiter import DomainRateLimiter, RateLimiterConfig
+
+            config = RateLimiterConfig(**(rate_limit_config or {}))
+            self.rate_limiter = DomainRateLimiter(config)
+        else:
+            self.rate_limiter = None
+
+        # Initialize anti-bot manager
+        if self.enable_anti_bot:
+            from ..utils.anti_bot import AntiBotManager, AntiBotConfig
+
+            config = AntiBotConfig(**(anti_bot_config or {}))
+            self.anti_bot = AntiBotManager(config)
+        else:
+            self.anti_bot = None
 
     async def scrape(self, url: str) -> str:
         if self.backend == "playwright":
@@ -233,6 +268,11 @@ class ChromiumLoader(BaseLoader):
 
         while attempt < self.retry_limit:
             try:
+                # Apply rate limiting
+                if self.rate_limiter:
+                    delay = await self.rate_limiter.acquire(url, retry_attempt=attempt)
+                    logger.debug(f"Rate limit delay: {delay:.2f}s")
+
                 async with async_playwright() as p:
                     browser = None
                     if browser_name == "chromium":
@@ -249,10 +289,38 @@ class ChromiumLoader(BaseLoader):
                         )
                     else:
                         raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context()
+
+                    # Create context with anti-bot options
+                    context_options = {}
+                    if self.anti_bot:
+                        context_options.update(self.anti_bot.get_context_options())
+
+                    context = await browser.new_context(**context_options)
                     await Malenia.apply_stealth(context)
+
+                    # Apply additional anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context)
+
                     page = await context.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
+
+                    # Apply page-level anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context, page)
+
+                    # Navigate to page
+                    response = await page.goto(url, wait_until="domcontentloaded")
+
+                    # Check for rate limiting response
+                    if response and response.status == 429:
+                        retry_after = response.headers.get("retry-after")
+                        retry_after_seconds = int(retry_after) if retry_after else None
+
+                        if self.rate_limiter:
+                            self.rate_limiter.handle_429(url, retry_after_seconds)
+
+                        raise aiohttp.ClientError(f"Rate limited (429) for {url}")
+
                     await page.wait_for_load_state(self.load_state)
 
                     previous_height = None
@@ -311,6 +379,13 @@ class ChromiumLoader(BaseLoader):
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
                 logger.error(f"Attempt {attempt} failed: {e}")
+
+                # Add exponential backoff delay on retry
+                if attempt < self.retry_limit:
+                    backoff = min(2**attempt, 30)
+                    logger.info(f"Retrying after {backoff}s backoff")
+                    await asyncio.sleep(backoff)
+
                 if attempt == self.retry_limit:
                     results = (
                         f"Error: Network error after {self.retry_limit} attempts - {e}"
@@ -343,6 +418,11 @@ class ChromiumLoader(BaseLoader):
 
         while attempt < self.retry_limit:
             try:
+                # Apply rate limiting
+                if self.rate_limiter:
+                    delay = await self.rate_limiter.acquire(url, retry_attempt=attempt)
+                    logger.debug(f"Rate limit delay: {delay:.2f}s")
+
                 async with async_playwright() as p, async_timeout.timeout(self.timeout):
                     browser = None
                     if browser_name == "chromium":
@@ -359,13 +439,44 @@ class ChromiumLoader(BaseLoader):
                         )
                     else:
                         raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context(
-                        storage_state=self.storage_state,
-                        ignore_https_errors=True,
-                    )
+
+                    # Create context with anti-bot options
+                    context_options = {
+                        "storage_state": self.storage_state,
+                        "ignore_https_errors": True,
+                    }
+
+                    if self.anti_bot:
+                        context_options.update(self.anti_bot.get_context_options())
+
+                    context = await browser.new_context(**context_options)
+
+                    # Apply stealth
                     await Malenia.apply_stealth(context)
+
+                    # Apply additional anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context)
+
                     page = await context.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
+
+                    # Apply page-level anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context, page)
+
+                    # Navigate to page
+                    response = await page.goto(url, wait_until="domcontentloaded")
+
+                    # Check for rate limiting response
+                    if response and response.status == 429:
+                        retry_after = response.headers.get("retry-after")
+                        retry_after_seconds = int(retry_after) if retry_after else None
+
+                        if self.rate_limiter:
+                            self.rate_limiter.handle_429(url, retry_after_seconds)
+
+                        raise aiohttp.ClientError(f"Rate limited (429) for {url}")
+
                     await page.wait_for_load_state(self.load_state)
                     results = await page.content()
                     logger.info("Content scraped")
@@ -374,6 +485,14 @@ class ChromiumLoader(BaseLoader):
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
                 logger.error(f"Attempt {attempt} failed: {e}")
+
+                # Add exponential backoff delay on retry
+                if attempt < self.retry_limit:
+                    # Even without rate_limiter, add basic backoff
+                    backoff = min(2**attempt, 30)  # Max 30 seconds
+                    logger.info(f"Retrying after {backoff}s backoff")
+                    await asyncio.sleep(backoff)
+
                 if attempt == self.retry_limit:
                     raise RuntimeError(
                         f"Failed to scrape after {self.retry_limit} attempts: {str(e)}"
@@ -402,6 +521,11 @@ class ChromiumLoader(BaseLoader):
 
         while attempt < self.retry_limit:
             try:
+                # Apply rate limiting
+                if self.rate_limiter:
+                    delay = await self.rate_limiter.acquire(url, retry_attempt=attempt)
+                    logger.debug(f"Rate limit delay: {delay:.2f}s")
+
                 async with async_playwright() as p, async_timeout.timeout(self.timeout):
                     browser = None
                     if browser_name == "chromium":
@@ -418,17 +542,51 @@ class ChromiumLoader(BaseLoader):
                         )
                     else:
                         raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context(
-                        storage_state=self.storage_state
-                    )
+
+                    # Create context with anti-bot options
+                    context_options = {"storage_state": self.storage_state}
+
+                    if self.anti_bot:
+                        context_options.update(self.anti_bot.get_context_options())
+
+                    context = await browser.new_context(**context_options)
+
+                    # Apply additional anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context)
+
                     page = await context.new_page()
-                    await page.goto(url, wait_until="networkidle")
+
+                    # Apply page-level anti-bot measures
+                    if self.anti_bot:
+                        await self.anti_bot.apply_to_context(context, page)
+
+                    # Navigate to page
+                    response = await page.goto(url, wait_until="networkidle")
+
+                    # Check for rate limiting response
+                    if response and response.status == 429:
+                        retry_after = response.headers.get("retry-after")
+                        retry_after_seconds = int(retry_after) if retry_after else None
+
+                        if self.rate_limiter:
+                            self.rate_limiter.handle_429(url, retry_after_seconds)
+
+                        raise aiohttp.ClientError(f"Rate limited (429) for {url}")
+
                     results = await page.content()
                     logger.info("Content scraped after JavaScript rendering")
                     return results
             except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
                 attempt += 1
                 logger.error(f"Attempt {attempt} failed: {e}")
+
+                # Add exponential backoff delay on retry
+                if attempt < self.retry_limit:
+                    backoff = min(2**attempt, 30)
+                    logger.info(f"Retrying after {backoff}s backoff")
+                    await asyncio.sleep(backoff)
+
                 if attempt == self.retry_limit:
                     raise RuntimeError(
                         f"Failed to scrape after {self.retry_limit} attempts: {str(e)}"
@@ -461,9 +619,10 @@ class ChromiumLoader(BaseLoader):
         """
         Asynchronously load text content from the provided URLs.
 
-        This method leverages asyncio to initiate the scraping of all provided URLs
-        simultaneously. It improves performance by utilizing concurrent asynchronous
-        requests. Each Document is yielded as soon as its content is available,
+        This method leverages asyncio to initiate the scraping of all provided URLs.
+        When rate limiting is enabled, requests are processed sequentially to respect
+        per-domain rate limits. When disabled, requests are processed concurrently.
+        Each Document is yielded as soon as its content is available,
         encapsulating the scraped content.
 
         Yields:
@@ -476,8 +635,23 @@ class ChromiumLoader(BaseLoader):
             else getattr(self, f"ascrape_{self.backend}")
         )
 
-        tasks = [scraping_fn(url) for url in self.urls]
-        results = await asyncio.gather(*tasks)
-        for url, content in zip(self.urls, results):
-            metadata = {"source": url}
-            yield Document(page_content=content, metadata=metadata)
+        # If rate limiting is disabled, use original parallel approach
+        if not self.enable_rate_limiting:
+            tasks = [scraping_fn(url) for url in self.urls]
+            results = await asyncio.gather(*tasks)
+            for url, content in zip(self.urls, results):
+                metadata = {"source": url}
+                yield Document(page_content=content, metadata=metadata)
+            return
+
+        # With rate limiting, process requests sequentially or with controlled concurrency
+        for url in self.urls:
+            try:
+                content = await scraping_fn(url)
+                metadata = {"source": url}
+                yield Document(page_content=content, metadata=metadata)
+            except Exception as e:
+                logger.error(f"Failed to scrape {url}: {e}")
+                # Yield error document
+                metadata = {"source": url, "error": str(e)}
+                yield Document(page_content="", metadata=metadata)

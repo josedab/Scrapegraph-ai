@@ -54,6 +54,8 @@ from .screenshot_scraping.text_detection import detect_text
 from .split_text_into_chunks import split_text_into_chunks
 from .sys_dynamic_import import dynamic_import, srcfile_import
 from .tokenizer import num_tokens_calculus
+from .rate_limiter import DomainRateLimiter, RateLimiterConfig, DomainState
+from .anti_bot import AntiBotManager, AntiBotConfig
 
 __all__ = [
     # Code cleanup and analysis
@@ -114,4 +116,10 @@ __all__ = [
     "set_formatting",
     "unset_formatting",
     "warning_once",
+    # Rate limiting and anti-bot
+    "DomainRateLimiter",
+    "RateLimiterConfig",
+    "DomainState",
+    "AntiBotManager",
+    "AntiBotConfig",
 ]
