@@ -40,8 +40,14 @@ lib/
 .idea
 
 # extras
-cache/
+# Ignore data cache directories but not source code
+**/cache/*.db
+**/cache/*.sqlite
+/.scrapegraph_cache/
+/cache/
 run_smart_scraper.py
+# But allow the utils/cache source code directory
+!scrapegraphai/utils/cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

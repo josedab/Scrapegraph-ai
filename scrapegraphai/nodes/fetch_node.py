@@ -3,6 +3,7 @@ FetchNode Module
 """
 
 import json
+import hashlib
 from typing import List, Optional
 import concurrent.futures
 
@@ -86,6 +87,38 @@ class FetchNode(BaseNode):
         self.storage_state = (
             None if node_config is None else node_config.get("storage_state", None)
         )
+
+        # Incremental scraping configuration
+        self.incremental_config = (
+            None if node_config is None else node_config.get("incremental", None)
+        )
+
+        # Initialize cache if incremental scraping is enabled
+        self.cache = None
+        if self.incremental_config and self.incremental_config.get("enabled", False):
+            self._init_incremental_cache()
+
+    def _init_incremental_cache(self):
+        """Initialize the cache backend for incremental scraping."""
+        from ..utils.cache import get_cache
+
+        backend = self.incremental_config.get("cache_backend", "sqlite")
+
+        try:
+            if backend == "sqlite":
+                cache_path = self.incremental_config.get(
+                    "cache_path", ".scrapegraph_cache/fingerprints.db"
+                )
+                self.cache = get_cache("sqlite", cache_path=cache_path)
+            elif backend == "memory":
+                self.cache = get_cache("memory")
+            else:
+                raise ValueError(f"Unsupported cache backend: {backend}")
+
+            self.logger.info(f"Incremental scraping enabled with {backend} cache")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize cache: {e}")
+            self.cache = None
 
     def execute(self, state):
         """
@@ -264,6 +297,8 @@ class FetchNode(BaseNode):
         Handles the web source by fetching HTML content from a URL,
         optionally converting it to Markdown, and updating the state.
 
+        Enhanced to support incremental scraping with content fingerprinting.
+
         Parameters:
         state (dict): The current state of the graph.
         source (str): The URL of the web source to fetch HTML content from.
@@ -276,6 +311,25 @@ class FetchNode(BaseNode):
         """
 
         self.logger.info(f"--- (Fetching HTML from: {source}) ---")
+
+        # Check if incremental scraping is enabled
+        if self.cache is not None:
+            return self._handle_web_source_incremental(state, source)
+
+        # Fall back to standard non-incremental fetch
+        return self._handle_web_source_full(state, source)
+
+    def _handle_web_source_full(self, state, source):
+        """
+        Original non-incremental web source handling.
+
+        Parameters:
+        state (dict): The current state of the graph.
+        source (str): The URL of the web source to fetch HTML content from.
+
+        Returns:
+        dict: The updated state with the processed content.
+        """
         if self.use_soup:
             # Apply configured timeout to blocking HTTP requests. If timeout is None,
             # don't pass the timeout argument (requests will block until completion).
@@ -389,4 +443,321 @@ class FetchNode(BaseNode):
                 self.output[0]: compressed_document,
             }
         )
+        return state
+
+    def _handle_web_source_incremental(self, state, source):
+        """
+        Fetch web content with incremental scraping and fingerprinting.
+
+        This method implements content-based change detection using
+        cryptographic hashing to determine if content has changed.
+
+        Parameters:
+        state (dict): The current state of the graph.
+        source (str): The URL of the web source to fetch HTML content from.
+
+        Returns:
+        dict: The updated state with the processed content.
+        """
+        # Step 1: Quick check using HTTP headers (ETag, Last-Modified)
+        if self.incremental_config.get("use_http_headers", True):
+            if not self._has_server_side_changes(source):
+                cached_content = self.cache.get_content(source)
+                if cached_content:
+                    self.logger.info("--- Using cached content (no HTTP header changes detected) ---")
+                    return self._prepare_cached_response(state, source, cached_content)
+
+        # Step 2: Check if cached entry exists and is not expired
+        max_age = self.incremental_config.get("max_age", 0)
+        if max_age > 0 and self.cache.is_expired(source, max_age):
+            self.logger.info(f"--- Cached entry expired (max_age: {max_age}s) ---")
+        else:
+            # Check if we have a recent check
+            cached_entry = self.cache.get(source)
+            if cached_entry and self.incremental_config.get("cache_content", True):
+                # We have a recent entry, but need to verify content hasn't changed
+                # Fetch and compare fingerprints
+                pass  # Will fetch and compare below
+
+        # Step 3: Fetch content using standard method
+        try:
+            document = self._fetch_document(source)
+            if not document or not document[0].page_content.strip():
+                raise ValueError("No HTML body content found in the document.")
+
+            content = document[0].page_content
+
+            # Step 4: Normalize content for fingerprinting
+            normalized_content = self._normalize_content(content)
+
+            # Step 5: Generate fingerprint
+            fingerprint = self._generate_fingerprint(normalized_content)
+
+            # Step 6: Compare with cached fingerprint
+            cached_entry = self.cache.get(source)
+            if cached_entry and cached_entry["fingerprint"] == fingerprint:
+                self.logger.info("--- Content unchanged (fingerprint match) ---")
+                self.cache.update_last_checked(source)
+
+                # Return cached processed content if available
+                if self.incremental_config.get("cache_content", True):
+                    cached_content = self.cache.get_content(source)
+                    if cached_content:
+                        return self._prepare_cached_response(state, source, cached_content)
+
+            # Step 7: Content has changed or is new - process normally
+            self.logger.info("--- Content changed or new - processing ---")
+
+            # Process content (convert to markdown if needed)
+            parsed_content = self._process_document(document)
+
+            # Step 8: Update cache
+            metadata = {
+                "size": len(content),
+                "content_type": document[0].metadata.get("content_type", "text/html"),
+            }
+
+            # Extract ETag from response if available
+            if hasattr(document[0], "metadata") and "etag" in document[0].metadata:
+                metadata["etag"] = document[0].metadata["etag"]
+
+            self.cache.set(
+                url=source,
+                fingerprint=fingerprint,
+                content=parsed_content if self.incremental_config.get("cache_content", True) else None,
+                metadata=metadata
+            )
+
+            # Step 9: Return updated state
+            compressed_document = [
+                Document(page_content=parsed_content, metadata={"source": "html file"})
+            ]
+            state["doc"] = document
+            state.update({self.output[0]: compressed_document})
+            return state
+
+        except Exception as e:
+            self.logger.error(f"Error in incremental fetch: {e}")
+            # Fall back to non-incremental if there's an error
+            return self._handle_web_source_full(state, source)
+
+    def _fetch_document(self, source):
+        """
+        Fetch document from source URL.
+
+        Parameters:
+        source (str): The URL to fetch from
+
+        Returns:
+        list: List of Document objects
+        """
+        if self.use_soup:
+            if self.timeout is None:
+                response = requests.get(source)
+            else:
+                response = requests.get(source, timeout=self.timeout)
+
+            if response.status_code == 200:
+                if not response.text.strip():
+                    raise ValueError("No HTML body content found in the response.")
+
+                parsed_content = response.text
+                if not self.cut:
+                    parsed_content = cleanup_html(response, source)
+
+                return [Document(page_content=parsed_content, metadata={"source": source})]
+            else:
+                raise ValueError(f"Failed to retrieve contents from the webpage at url: {source}")
+        else:
+            loader_kwargs = self.node_config.get("loader_kwargs", {}) if self.node_config else {}
+
+            if "timeout" not in loader_kwargs and self.timeout is not None:
+                loader_kwargs["timeout"] = self.timeout
+
+            if self.browser_base:
+                try:
+                    from ..docloaders.browser_base import browser_base_fetch
+                except ImportError:
+                    raise ImportError(
+                        "The browserbase module is not installed. "
+                        "Please install it using `pip install browserbase`."
+                    )
+
+                data = browser_base_fetch(
+                    self.browser_base.get("api_key"),
+                    self.browser_base.get("project_id"),
+                    [source],
+                )
+
+                return [
+                    Document(page_content=content, metadata={"source": source})
+                    for content in data
+                ]
+            elif self.scrape_do:
+                from ..docloaders.scrape_do import scrape_do_fetch
+
+                if (
+                    (self.scrape_do.get("use_proxy") is None)
+                    or self.scrape_do.get("geoCode") is None
+                    or self.scrape_do.get("super_proxy") is None
+                ):
+                    data = scrape_do_fetch(self.scrape_do.get("api_key"), source)
+                else:
+                    data = scrape_do_fetch(
+                        self.scrape_do.get("api_key"),
+                        source,
+                        self.scrape_do.get("use_proxy"),
+                        self.scrape_do.get("geoCode"),
+                        self.scrape_do.get("super_proxy"),
+                    )
+
+                return [Document(page_content=data, metadata={"source": source})]
+            else:
+                loader = ChromiumLoader(
+                    [source],
+                    headless=self.headless,
+                    storage_state=self.storage_state,
+                    **loader_kwargs,
+                )
+                return loader.load()
+
+    def _process_document(self, document):
+        """
+        Process document content (convert to markdown if needed).
+
+        Parameters:
+        document (list): List of Document objects
+
+        Returns:
+        str: Processed content
+        """
+        parsed_content = document[0].page_content
+
+        if (
+            (
+                isinstance(self.llm_model, ChatOpenAI)
+                or isinstance(self.llm_model, AzureChatOpenAI)
+            )
+            and not self.script_creator
+            or self.force
+            and not self.script_creator
+            and not self.openai_md_enabled
+        ):
+            parsed_content = convert_to_md(document[0].page_content, parsed_content)
+
+        return parsed_content
+
+    def _has_server_side_changes(self, url: str) -> bool:
+        """
+        Quick check using HTTP headers (ETag, Last-Modified).
+
+        This performs a lightweight HEAD request to check if the server
+        indicates content has changed, avoiding a full content fetch.
+
+        Parameters:
+        url (str): The URL to check
+
+        Returns:
+        bool: True if content might have changed, False if unchanged
+        """
+        try:
+            cached_entry = self.cache.get(url)
+            if not cached_entry:
+                return True
+
+            # HEAD request with timeout
+            timeout = self.timeout if self.timeout else 10
+            response = requests.head(url, timeout=timeout, allow_redirects=True)
+
+            # Check ETag
+            if "ETag" in response.headers:
+                cached_etag = cached_entry.get("etag")
+                if cached_etag and response.headers["ETag"] == cached_etag:
+                    return False
+
+            # Check Last-Modified
+            if "Last-Modified" in response.headers:
+                from email.utils import parsedate_to_datetime
+                from datetime import datetime
+
+                try:
+                    last_modified = parsedate_to_datetime(response.headers["Last-Modified"])
+                    cached_modified = cached_entry.get("last_modified")
+
+                    if cached_modified:
+                        cached_dt = datetime.fromisoformat(cached_modified)
+                        if last_modified <= cached_dt:
+                            return False
+                except Exception:
+                    pass
+
+            return True
+        except Exception as e:
+            self.logger.warning(f"Error checking HTTP headers: {e}")
+            return True  # Assume changed if check fails
+
+    def _normalize_content(self, content: str) -> str:
+        """
+        Normalize content to reduce false positives from non-meaningful changes.
+
+        Parameters:
+        content (str): Raw HTML content
+
+        Returns:
+        str: Normalized content
+        """
+        strategy = self.incremental_config.get("normalization", "normalized")
+
+        if strategy == "full":
+            return content
+
+        if strategy == "custom":
+            normalize_fn = self.incremental_config.get("normalize_fn")
+            if normalize_fn:
+                return normalize_fn(content)
+
+        # Default normalized strategy
+        from ..utils.content_normalizer import normalize_html
+        return normalize_html(content, aggressive=False)
+
+    def _generate_fingerprint(self, content: str) -> str:
+        """
+        Generate cryptographic hash fingerprint of content.
+
+        Parameters:
+        content (str): Normalized content
+
+        Returns:
+        str: Hexadecimal hash string
+        """
+        algorithm = self.incremental_config.get("hash_algorithm", "sha256")
+
+        if algorithm == "sha256":
+            return hashlib.sha256(content.encode('utf-8')).hexdigest()
+        elif algorithm == "md5":
+            return hashlib.md5(content.encode('utf-8')).hexdigest()
+        else:
+            raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+
+    def _prepare_cached_response(self, state, source, cached_content):
+        """
+        Prepare response using cached content.
+
+        Parameters:
+        state (dict): The current state
+        source (str): The source URL
+        cached_content (str): Cached content
+
+        Returns:
+        dict: Updated state with cached content
+        """
+        document = [Document(page_content=cached_content, metadata={"source": source, "from_cache": True})]
+
+        compressed_document = [
+            Document(page_content=cached_content, metadata={"source": "html file", "from_cache": True})
+        ]
+
+        state["doc"] = document
+        state["from_cache"] = True
+        state.update({self.output[0]: compressed_document})
         return state
