@@ -24,6 +24,7 @@ from ..prompts import (
     TEMPLATE_NO_CHUNKS_MD,
 )
 from ..utils.output_parser import get_pydantic_output_parser
+from ..utils.cache import LLMCacheManager
 from .base_node import BaseNode
 
 
@@ -72,6 +73,10 @@ class GenerateAnswerNode(BaseNode):
         self.additional_info = node_config.get("additional_info")
         self.timeout = node_config.get("timeout", 480)
 
+        # Initialize LLM cache
+        self.cache_config = node_config.get("llm_cache", {})
+        self.llm_cache = LLMCacheManager(self.cache_config)
+
     def invoke_with_timeout(self, chain, inputs, timeout):
         """Helper method to invoke chain with timeout"""
         try:
@@ -86,6 +91,84 @@ class GenerateAnswerNode(BaseNode):
         except Exception as e:
             self.logger.error(f"Error during chain execution: {str(e)}")
             raise
+
+    def _get_model_identifier(self) -> str:
+        """Get unique model identifier for cache key."""
+        if isinstance(self.llm_model, ChatOpenAI):
+            return f"openai/{self.llm_model.model_name}"
+        elif isinstance(self.llm_model, ChatBedrock):
+            return f"bedrock/{self.llm_model.model}"
+        elif isinstance(self.llm_model, ChatOllama):
+            return f"ollama/{self.llm_model.model}"
+        else:
+            return f"unknown/{type(self.llm_model).__name__}"
+
+    def _try_get_cached_response(
+        self,
+        user_prompt: str,
+        doc,
+        format_instructions: str
+    ):
+        """Try to retrieve response from cache."""
+        if not self.llm_cache.enabled:
+            return None
+
+        try:
+            # Convert doc to string for cache key
+            content = str(doc) if not isinstance(doc, str) else doc
+
+            # Get model identifier
+            model_name = self._get_model_identifier()
+
+            # Check cache
+            cached_response = self.llm_cache.get_cached_response(
+                prompt=user_prompt,
+                content=content,
+                model=model_name,
+                temperature=getattr(self.llm_model, 'temperature', 0.0),
+                schema=self.node_config.get("schema"),
+                additional_info=self.additional_info
+            )
+
+            return cached_response
+
+        except Exception as e:
+            self.logger.error(f"Error checking cache: {e}")
+            return None
+
+    def _cache_response(
+        self,
+        user_prompt: str,
+        doc,
+        response,
+        generation_time: float,
+        format_instructions: str
+    ):
+        """Cache the LLM response."""
+        if not self.llm_cache.enabled:
+            return
+
+        try:
+            # Convert doc to string for cache key
+            content = str(doc) if not isinstance(doc, str) else doc
+
+            # Get model identifier
+            model_name = self._get_model_identifier()
+
+            # Store in cache
+            self.llm_cache.cache_response(
+                prompt=user_prompt,
+                content=content,
+                model=model_name,
+                response=response,
+                generation_time=generation_time,
+                temperature=getattr(self.llm_model, 'temperature', 0.0),
+                schema=self.node_config.get("schema"),
+                additional_info=self.additional_info
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error caching response: {e}")
 
     def process(self, state: dict) -> dict:
         """Process the input state and generate an answer."""
@@ -177,6 +260,22 @@ class GenerateAnswerNode(BaseNode):
             template_chunks_prompt = self.additional_info + template_chunks_prompt
             template_merge_prompt = self.additional_info + template_merge_prompt
 
+        # Check if response is cached
+        if self.llm_cache.enabled:
+            cached_response = self._try_get_cached_response(
+                user_prompt=user_prompt,
+                doc=doc,
+                format_instructions=format_instructions
+            )
+
+            if cached_response is not None:
+                self.logger.info("Using cached LLM response")
+                state.update({self.output[0]: cached_response})
+                return state
+
+        # Track generation time for caching
+        generation_start_time = time.time()
+
         if len(doc) == 1:
             prompt = PromptTemplate(
                 template=template_no_chunks_prompt,
@@ -192,6 +291,16 @@ class GenerateAnswerNode(BaseNode):
             try:
                 answer = self.invoke_with_timeout(
                     chain, {"content": doc, "question": user_prompt}, self.timeout
+                )
+
+                # Cache the response
+                generation_time = time.time() - generation_start_time
+                self._cache_response(
+                    user_prompt=user_prompt,
+                    doc=doc,
+                    response=answer,
+                    generation_time=generation_time,
+                    format_instructions=format_instructions
                 )
             except (Timeout, json.JSONDecodeError) as e:
                 error_msg = (
@@ -253,6 +362,16 @@ class GenerateAnswerNode(BaseNode):
                 merge_chain,
                 {"content": batch_results, "question": user_prompt},
                 self.timeout,
+            )
+
+            # Cache the response
+            generation_time = time.time() - generation_start_time
+            self._cache_response(
+                user_prompt=user_prompt,
+                doc=doc,
+                response=answer,
+                generation_time=generation_time,
+                format_instructions=format_instructions
             )
         except (Timeout, json.JSONDecodeError) as e:
             error_msg = (
