@@ -1,0 +1,81 @@
+```mermaid
+sequenceDiagram
+    actor User
+    participant Graph as SmartScraperGraph
+    participant AbstractG as AbstractGraph
+    participant BaseG as BaseGraph
+    participant Fetch as FetchNode
+    participant Browser as Playwright
+    participant Parse as ParseNode
+    participant Gen as GenerateAnswerNode
+    participant LLM as LangChain/LLM
+    participant Callback as CallbackManager
+
+    Note over User,Callback: Initialization Phase
+    User->>Graph: SmartScraperGraph(prompt, source, config)
+    Graph->>AbstractG: __init__(prompt, source, config)
+    AbstractG->>AbstractG: _create_llm(config["llm"])
+    AbstractG-->>LLM: Create LLM instance (OpenAI/Ollama/etc)
+    AbstractG->>Graph: _create_graph()
+    Graph->>BaseG: BaseGraph(nodes=[Fetch,Parse,Gen], edges=[(Fetch,Parse),(Parse,Gen)])
+    BaseG-->>Graph: Graph instance
+    Graph-->>User: Graph ready
+
+    Note over User,Callback: Execution Phase
+    User->>Graph: run()
+    Graph->>BaseG: execute({user_prompt, url})
+    BaseG->>BaseG: _execute_standard(initial_state)
+
+    Note over BaseG,Callback: State: {user_prompt, url}
+
+    rect rgb(230, 245, 255)
+        Note over BaseG,Browser: Node 1: FetchNode
+        BaseG->>Fetch: execute(state)
+        Fetch->>Browser: ChromiumLoader.load(url)
+        Browser-->>Fetch: [Document(page_content="<html>...")]
+        Fetch->>Fetch: Update state["doc"] = documents
+        Fetch-->>BaseG: state
+        Note over BaseG: State: {user_prompt, url, doc: [Document]}
+    end
+
+    rect rgb(245, 230, 255)
+        Note over BaseG,Parse: Node 2: ParseNode
+        BaseG->>Parse: execute(state)
+        Parse->>Parse: cleanup_html(state["doc"])
+        Parse->>Parse: split_text_in_chunks(cleaned_text)
+        Parse->>Parse: Update state["parsed_doc"] = chunks
+        Parse-->>BaseG: state
+        Note over BaseG: State: {user_prompt, url, doc, parsed_doc: "chunked text"}
+    end
+
+    rect rgb(255, 245, 230)
+        Note over BaseG,Callback: Node 3: GenerateAnswerNode
+        BaseG->>Gen: execute(state)
+        Gen->>Gen: Build prompt with user_prompt + parsed_doc
+        Gen->>Callback: Create callback handler
+        Callback-->>Gen: CustomCallbackHandler
+
+        Gen->>LLM: chain.invoke({"question": prompt, "context": chunks})
+        activate LLM
+        Note over LLM: Processing with GPT-4/Claude/etc
+        LLM-->>Gen: {result: {...}}
+        deactivate LLM
+
+        Gen->>Callback: Track tokens used
+        Callback->>Callback: Calculate cost
+
+        Gen->>Gen: Parse JSON response
+        Gen->>Gen: Update state["answer"] = result
+        Gen-->>BaseG: state
+        Note over BaseG: State: {user_prompt, url, doc, parsed_doc, answer: {...}}
+    end
+
+    BaseG->>BaseG: Collect execution_info
+    Note over BaseG: execution_info = [{node: "Fetch", time: 1.2s},<br/>{node: "Parse", time: 0.1s},<br/>{node: "Generate", tokens: 1500, cost: $0.02}]
+
+    BaseG-->>Graph: (state, execution_info)
+    Graph->>Graph: Extract state["answer"]
+    Graph-->>User: answer
+
+    Note over User: User receives extracted data
+```

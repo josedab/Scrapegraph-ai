@@ -1,0 +1,108 @@
+```mermaid
+stateDiagram-v2
+    [*] --> NodeCreation: BaseNode.__init__()
+
+    state NodeCreation {
+        [*] --> ValidateType: Check node_type
+        ValidateType --> SetAttributes: Set name, input, output
+        SetAttributes --> [*]
+    }
+
+    NodeCreation --> WaitingForExecution: Node added to graph
+
+    state WaitingForExecution {
+        [*] --> InQueue: In BaseGraph.nodes[]
+        note right of InQueue
+            Node waits for its turn
+            in the execution pipeline
+        end note
+    }
+
+    WaitingForExecution --> ExecutionStarted: BaseGraph calls execute(state)
+
+    state ExecutionStarted {
+        [*] --> ParseInputKeys: get_input_keys(state)
+
+        state ParseInputKeys {
+            [*] --> EvaluateExpression: _parse_input_keys()
+            EvaluateExpression --> CheckOperators: Handle & and |
+            CheckOperators --> ValidateKeys: Ensure keys exist
+            ValidateKeys --> [*]: Return [key1, key2, ...]
+        }
+
+        ParseInputKeys --> ExtractInputData: input_data = [state[key] for key in keys]
+        ExtractInputData --> CallExecute: self.execute(state)
+
+        state CallExecute {
+            [*] --> NodeLogic: Node-specific processing
+
+            state NodeLogic {
+                state "FetchNode" as fetch
+                state "ParseNode" as parse
+                state "GenerateAnswerNode" as gen
+
+                fetch: Playwright.load(url)
+                parse: cleanup_html() → chunk()
+                gen: LLM.invoke(prompt + context)
+            }
+
+            NodeLogic --> UpdateState: Modify state dict
+            UpdateState --> [*]: Return updated state
+        }
+
+        CallExecute --> [*]
+    }
+
+    ExecutionStarted --> DetermineNext: Which node next?
+
+    state DetermineNext {
+        state IsConditional <<choice>>
+        [*] --> IsConditional
+        IsConditional --> EvaluateCondition: node_type == "conditional_node"
+        IsConditional --> FollowEdge: node_type == "node"
+
+        EvaluateCondition --> ReturnNodeName: Return "next_node_name"
+        FollowEdge --> LookupEdges: edges.get(current_node_name)
+
+        ReturnNodeName --> [*]
+        LookupEdges --> [*]
+    }
+
+    DetermineNext --> HasNext: next_node_name exists?
+
+    state HasNext <<choice>>
+    HasNext --> WaitingForExecution: Yes - Queue next node
+    HasNext --> ExecutionComplete: No - End of graph
+
+    ExecutionComplete --> [*]
+
+    state ErrorHandling {
+        note left of ErrorHandling
+            If execute() raises exception:
+            1. Capture error context
+            2. Update execution_info
+            3. Propagate to BaseGraph
+            4. BaseGraph raises to user
+        end note
+    }
+
+    ExecutionStarted --> ErrorHandling: Exception raised
+    ErrorHandling --> [*]: Terminate graph
+
+    note right of NodeCreation
+        Node Configuration:
+        - node_name: str
+        - node_type: "node" | "conditional_node"
+        - input: "key1 & key2 | key3"
+        - output: ["output_key"]
+        - node_config: Optional[dict]
+    end note
+
+    note left of CallExecute
+        State Evolution Example:
+        Input:  {url: "...", user_prompt: "..."}
+        Fetch:  {url, user_prompt, doc: [Document]}
+        Parse:  {url, user_prompt, doc, parsed_doc: "..."}
+        Gen:    {url, user_prompt, doc, parsed_doc, answer: {...}}
+    end note
+```

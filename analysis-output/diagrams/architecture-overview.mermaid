@@ -1,0 +1,121 @@
+```mermaid
+graph TB
+    subgraph "User Layer"
+        User[👤 Developer]
+        Config[⚙️ Configuration Dict]
+    end
+
+    subgraph "Graph Layer - scrapegraphai/graphs/"
+        AbstractGraph[AbstractGraph<br/>Base orchestration]
+        SmartScraper[SmartScraperGraph<br/>Single page]
+        SearchGraph[SearchGraph<br/>Multi-page search]
+        DocGraph[DocumentScraperGraph<br/>Local files]
+        MultiGraph[SmartScraperMultiGraph<br/>Parallel execution]
+        Custom[CustomGraph<br/>User-defined]
+    end
+
+    subgraph "Execution Engine - base_graph.py"
+        BaseGraph[BaseGraph<br/>Execution orchestrator]
+        Execute[_execute_standard<br/>Sequential traversal]
+        CallbackMgr[CustomLLMCallbackManager<br/>Token tracking]
+    end
+
+    subgraph "Node Layer - scrapegraphai/nodes/"
+        direction TB
+        FetchNode[FetchNode<br/>Browser automation]
+        ParseNode[ParseNode<br/>HTML → Text]
+        RAGNode[RAGNode<br/>Vector search]
+        GenNode[GenerateAnswerNode<br/>LLM extraction]
+        ConditionalNode[ConditionalNode<br/>Branching logic]
+    end
+
+    subgraph "Infrastructure Layer"
+        direction LR
+        subgraph "Browser - docloaders/"
+            Playwright[Playwright<br/>chromium.py]
+            BrowserBase[BrowserBase<br/>Cloud browsers]
+        end
+
+        subgraph "LLM - models/"
+            LangChain[LangChain Framework]
+            OpenAI[OpenAI GPT-4]
+            Anthropic[Anthropic Claude]
+            Ollama[Ollama Local]
+            Custom_LLM[Custom Models]
+        end
+
+        subgraph "Utilities - utils/"
+            Logger[logging.py<br/>Logging]
+            Tokenizer[tokenizers/<br/>Token counting]
+            HTMLClean[cleanup_html.py]
+            Chunker[split_text_in_chunks.py]
+        end
+    end
+
+    subgraph "State Flow"
+        State1[State: {user_prompt, url}]
+        State2[State: {url, doc}]
+        State3[State: {doc, parsed_doc}]
+        State4[State: {parsed_doc, answer}]
+    end
+
+    %% User interactions
+    User -->|Creates with prompt & source| SmartScraper
+    User -->|Provides| Config
+    Config -->|llm, verbose, timeout| AbstractGraph
+
+    %% Graph hierarchy
+    AbstractGraph -->|Extends| SmartScraper
+    AbstractGraph -->|Extends| SearchGraph
+    AbstractGraph -->|Extends| DocGraph
+    AbstractGraph -->|Extends| MultiGraph
+    AbstractGraph -->|Extends| Custom
+
+    %% Graph to execution
+    AbstractGraph -->|Creates| BaseGraph
+    BaseGraph -->|Runs| Execute
+    Execute -->|Uses| CallbackMgr
+
+    %% Execution to nodes
+    Execute -->|Node 1| FetchNode
+    Execute -->|Node 2| ParseNode
+    Execute -->|Node 3 Optional| RAGNode
+    Execute -->|Node 4| GenNode
+    Execute -->|Branch| ConditionalNode
+
+    %% Nodes to infrastructure
+    FetchNode -->|Uses| Playwright
+    FetchNode -->|Or uses| BrowserBase
+    ParseNode -->|Uses| HTMLClean
+    ParseNode -->|Uses| Chunker
+    GenNode -->|Calls| LangChain
+    LangChain -->|Routes to| OpenAI
+    LangChain -->|Routes to| Anthropic
+    LangChain -->|Routes to| Ollama
+    LangChain -->|Routes to| Custom_LLM
+
+    %% Token tracking
+    GenNode -->|Reports to| CallbackMgr
+    CallbackMgr -->|Logs metrics| Logger
+
+    %% State flow
+    State1 -->|FetchNode| State2
+    State2 -->|ParseNode| State3
+    State3 -->|GenerateAnswerNode| State4
+    State4 -->|Returns| User
+
+    %% Styling
+    classDef userClass fill:#E8F5E9,stroke:#4CAF50,stroke-width:2px
+    classDef graphClass fill:#E3F2FD,stroke:#2196F3,stroke-width:2px
+    classDef engineClass fill:#FFF3E0,stroke:#FF9800,stroke-width:2px
+    classDef nodeClass fill:#F3E5F5,stroke:#9C27B0,stroke-width:2px
+    classDef infraClass fill:#FFEBEE,stroke:#F44336,stroke-width:2px
+    classDef stateClass fill:#E0F2F1,stroke:#009688,stroke-width:2px
+
+    class User,Config userClass
+    class AbstractGraph,SmartScraper,SearchGraph,DocGraph,MultiGraph,Custom graphClass
+    class BaseGraph,Execute,CallbackMgr engineClass
+    class FetchNode,ParseNode,RAGNode,GenNode,ConditionalNode nodeClass
+    class Playwright,BrowserBase,LangChain,OpenAI,Anthropic,Ollama,Custom_LLM,Logger,Tokenizer,HTMLClean,Chunker infraClass
+    class State1,State2,State3,State4 stateClass
+```
