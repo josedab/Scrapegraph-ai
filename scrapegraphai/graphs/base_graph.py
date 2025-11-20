@@ -4,7 +4,9 @@ base_graph module
 
 import time
 import warnings
-from typing import Tuple
+import traceback
+import uuid
+from typing import Tuple, Optional
 
 from ..telemetry import log_graph_execution
 from ..utils import CustomLLMCallbackManager
@@ -61,6 +63,7 @@ class BaseGraph:
         use_burr: bool = False,
         burr_config: dict = None,
         graph_name: str = "Custom",
+        config: dict = None,
     ):
         self.nodes = nodes
         self.raw_edges = edges
@@ -69,6 +72,20 @@ class BaseGraph:
         self.graph_name = graph_name
         self.initial_state = {}
         self.callback_manager = CustomLLMCallbackManager()
+        self.config = config or {}
+
+        # Initialize event emitter if events are enabled
+        events_config = self.config.get("events", {})
+        self.event_emitter: Optional['EventEmitter'] = None
+        if events_config.get("enabled", False):
+            try:
+                from ..events import EventEmitter
+                self.event_emitter = EventEmitter(events_config)
+            except ImportError:
+                logger.warning("Events module not available. Events will be disabled.")
+
+        # Generate unique graph ID
+        self.graph_id = self.config.get("graph_id", str(uuid.uuid4()))
 
         if nodes[0].node_name != entry_point.node_name:
             warnings.warn(
@@ -233,11 +250,49 @@ class BaseGraph:
 
         return self.edges.get(current_node.node_name)
 
+    def _get_safe_config(self) -> dict:
+        """Get sanitized config for event emission (remove sensitive data)."""
+        safe_config = self.config.copy()
+
+        # Remove sensitive keys
+        sensitive_keys = ["api_key", "password", "secret", "token", "llm"]
+        for key in sensitive_keys:
+            if key in safe_config:
+                safe_config[key] = "***REDACTED***"
+
+        return safe_config
+
+    def _get_safe_result(self, state: dict) -> dict:
+        """Get sanitized result for event emission."""
+        # Limit size of result in events
+        max_length = self.config.get("events", {}).get("max_result_length", 1000)
+
+        result_str = str(state.get("answer", state.get("result", "")))
+        if len(result_str) > max_length:
+            result_str = result_str[:max_length] + "... (truncated)"
+
+        return {"result_preview": result_str}
+
     def _execute_standard(self, initial_state: dict) -> Tuple[dict, list]:
         """
         Executes the graph by traversing nodes
         starting from the entry point using the standard method.
         """
+        # Emit graph started event
+        if self.event_emitter:
+            try:
+                from ..events import Event, EventType
+                self.event_emitter.emit(Event(
+                    event_type=EventType.GRAPH_STARTED,
+                    graph_id=self.graph_id,
+                    graph_name=self.graph_name,
+                    data={
+                        "config": self._get_safe_config(),
+                    }
+                ))
+            except ImportError:
+                pass
+
         current_node_name = self.entry_point
         state = initial_state
 
@@ -261,6 +316,9 @@ class BaseGraph:
         prompt = None
         schema = None
 
+        total_nodes = len(self.nodes)
+        node_index = 0
+
         while current_node_name:
             current_node = self._get_node_by_name(current_node_name)
 
@@ -277,6 +335,23 @@ class BaseGraph:
             if schema is None:
                 schema = self._get_schema(current_node)
 
+            # Emit node started event
+            if self.event_emitter:
+                try:
+                    from ..events import Event, EventType
+                    self.event_emitter.emit(Event(
+                        event_type=EventType.NODE_STARTED,
+                        graph_id=self.graph_id,
+                        graph_name=self.graph_name,
+                        node_name=current_node.node_name,
+                        data={
+                            "node_type": current_node.__class__.__name__,
+                            "progress": (node_index / total_nodes) * 100 if total_nodes > 0 else 0,
+                        }
+                    ))
+                except ImportError:
+                    pass
+
             try:
                 result, node_exec_time, cb_data = self._execute_node(
                     current_node, state, llm_model, llm_model_name
@@ -288,10 +363,46 @@ class BaseGraph:
                     for key in cb_total:
                         cb_total[key] += cb_data[key]
 
+                # Emit node completed event
+                if self.event_emitter:
+                    try:
+                        from ..events import Event, EventType
+                        node_index += 1
+                        self.event_emitter.emit(Event(
+                            event_type=EventType.NODE_COMPLETED,
+                            graph_id=self.graph_id,
+                            graph_name=self.graph_name,
+                            node_name=current_node.node_name,
+                            data={
+                                "node_type": current_node.__class__.__name__,
+                                "progress": (node_index / total_nodes) * 100 if total_nodes > 0 else 0,
+                                "exec_time": node_exec_time,
+                            }
+                        ))
+                    except ImportError:
+                        pass
+
                 current_node_name = self._get_next_node(current_node, result)
 
             except Exception as e:
                 error_node = current_node.node_name
+
+                # Emit node failed event
+                if self.event_emitter:
+                    try:
+                        from ..events import Event, EventType
+                        self.event_emitter.emit(Event(
+                            event_type=EventType.NODE_FAILED,
+                            graph_id=self.graph_id,
+                            graph_name=self.graph_name,
+                            node_name=current_node.node_name,
+                            error=str(e),
+                            error_type=e.__class__.__name__,
+                            data={"node_type": current_node.__class__.__name__}
+                        ))
+                    except ImportError:
+                        pass
+
                 graph_execution_time = time.time() - start_time
                 log_graph_execution(
                     graph_name=self.graph_name,
@@ -305,6 +416,22 @@ class BaseGraph:
                     error_node=error_node,
                     exception=str(e),
                 )
+
+                # Emit graph failed event
+                if self.event_emitter:
+                    try:
+                        from ..events import Event, EventType
+                        self.event_emitter.emit(Event(
+                            event_type=EventType.GRAPH_FAILED,
+                            graph_id=self.graph_id,
+                            graph_name=self.graph_name,
+                            error=str(e),
+                            error_type=e.__class__.__name__,
+                            stack_trace=traceback.format_exc(),
+                        ))
+                    except ImportError:
+                        pass
+
                 raise e
 
         exec_info.append(
@@ -339,6 +466,25 @@ class BaseGraph:
             ),
         )
 
+        # Emit graph completed event
+        if self.event_emitter:
+            try:
+                from ..events import Event, EventType
+                self.event_emitter.emit(Event(
+                    event_type=EventType.GRAPH_COMPLETED,
+                    graph_id=self.graph_id,
+                    graph_name=self.graph_name,
+                    data={
+                        "result": self._get_safe_result(state),
+                        "nodes_executed": total_nodes,
+                        "execution_time": graph_execution_time,
+                        "total_tokens": cb_total["total_tokens"],
+                        "total_cost_USD": cb_total["total_cost_USD"],
+                    }
+                ))
+            except ImportError:
+                pass
+
         return state, exec_info
 
     def execute(self, initial_state: dict) -> Tuple[dict, list]:
@@ -352,30 +498,39 @@ class BaseGraph:
             Tuple[dict, list]: A tuple containing the final state and a list of execution info.
         """
 
-        self.initial_state = initial_state
-        if self.use_burr:
-            from ..integrations import BurrBridge
+        try:
+            self.initial_state = initial_state
+            if self.use_burr:
+                from ..integrations import BurrBridge
 
-            bridge = BurrBridge(self, self.burr_config)
-            result = bridge.execute(initial_state)
-            state, exec_info = (result["_state"], [])
-        else:
-            state, exec_info = self._execute_standard(initial_state)
+                bridge = BurrBridge(self, self.burr_config)
+                result = bridge.execute(initial_state)
+                state, exec_info = (result["_state"], [])
+            else:
+                state, exec_info = self._execute_standard(initial_state)
 
-        # Print the result first
-        if "answer" in state:
-            print(state["answer"])
-        elif "parsed_doc" in state:
-            print(state["parsed_doc"])
-        elif "generated_code" in state:
-            print(state["generated_code"])
-        elif "merged_script" in state:
-            print(state["merged_script"])
+            # Print the result first
+            if "answer" in state:
+                print(state["answer"])
+            elif "parsed_doc" in state:
+                print(state["parsed_doc"])
+            elif "generated_code" in state:
+                print(state["generated_code"])
+            elif "merged_script" in state:
+                print(state["merged_script"])
 
-        # Then show the message ONLY ONCE
-        print(f"✨ Try enhanced version of ScrapegraphAI at {CLICKABLE_URL} ✨")
+            # Then show the message ONLY ONCE
+            print(f"✨ Try enhanced version of ScrapegraphAI at {CLICKABLE_URL} ✨")
 
-        return state, exec_info
+            return state, exec_info
+
+        finally:
+            # Cleanup event emitter
+            if self.event_emitter:
+                try:
+                    self.event_emitter.shutdown()
+                except Exception as e:
+                    logger.error(f"Failed to shutdown event emitter: {e}")
 
     def append_node(self, node):
         """
