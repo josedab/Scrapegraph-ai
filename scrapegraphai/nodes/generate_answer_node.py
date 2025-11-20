@@ -4,7 +4,7 @@ GenerateAnswerNode Module
 
 import json
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from langchain.prompts import PromptTemplate
 from langchain_aws import ChatBedrock
@@ -24,6 +24,12 @@ from ..prompts import (
     TEMPLATE_NO_CHUNKS_MD,
 )
 from ..utils.output_parser import get_pydantic_output_parser
+from ..utils.validation import (
+    ValidationEngine,
+    ConfidenceScorer,
+    ValidatedResponse,
+    create_minimal_rules
+)
 from .base_node import BaseNode
 
 
@@ -72,6 +78,31 @@ class GenerateAnswerNode(BaseNode):
         self.additional_info = node_config.get("additional_info")
         self.timeout = node_config.get("timeout", 480)
 
+        # Validation and confidence scoring configuration
+        self.enable_validation = node_config.get("enable_validation", False)
+        self.validation_rules = node_config.get("validation_rules", None)
+        self.expected_fields = node_config.get("expected_fields", None)
+        self.required_fields = node_config.get("required_fields", None)
+        self.min_confidence = node_config.get("min_confidence", 0.7)
+        self.min_completeness = node_config.get("min_completeness", 0.8)
+
+        # Initialize validation engine if enabled
+        if self.enable_validation:
+            if self.validation_rules:
+                self.validation_engine = ValidationEngine(self.validation_rules)
+            else:
+                # Use minimal rules by default
+                self.validation_engine = ValidationEngine(create_minimal_rules())
+
+            # Initialize confidence scorer
+            self.confidence_scorer = ConfidenceScorer(
+                expected_fields=self.expected_fields,
+                required_fields=self.required_fields
+            )
+        else:
+            self.validation_engine = None
+            self.confidence_scorer = None
+
     def invoke_with_timeout(self, chain, inputs, timeout):
         """Helper method to invoke chain with timeout"""
         try:
@@ -86,6 +117,68 @@ class GenerateAnswerNode(BaseNode):
         except Exception as e:
             self.logger.error(f"Error during chain execution: {str(e)}")
             raise
+
+    def _validate_and_score_response(
+        self,
+        response: Any,
+        context: Optional[Dict[str, Any]] = None
+    ) -> ValidatedResponse:
+        """
+        Validate and score the LLM response.
+
+        Args:
+            response: The raw response from the LLM
+            context: Additional context for validation (prompt, schema, etc.)
+
+        Returns:
+            ValidatedResponse object with validation results and confidence scores
+        """
+        if context is None:
+            context = {}
+
+        # Ensure response is a dictionary
+        if not isinstance(response, dict):
+            # If response is not a dict, wrap it
+            response = {"content": response}
+
+        # Run validation
+        validation_result = self.validation_engine.validate(response, context)
+
+        # Calculate confidence scores
+        confidence_scores = self.confidence_scorer.calculate_scores(
+            response,
+            validation_result
+        )
+
+        # Create enhanced response object
+        validated_response = ValidatedResponse(
+            data=response,
+            validation_result=validation_result,
+            confidence_scores=confidence_scores,
+            raw_response=response
+        )
+
+        # Log validation results if verbose
+        if self.verbose:
+            self.logger.info(
+                f"Validation: passed={validated_response.is_valid}, "
+                f"confidence={validated_response.confidence:.2f}, "
+                f"completeness={validated_response.completeness:.2f}"
+            )
+
+            if validated_response.has_errors:
+                self.logger.warning(
+                    f"Validation errors: {len(validated_response.errors)}"
+                )
+                for error in validated_response.errors[:3]:  # Show first 3 errors
+                    self.logger.warning(f"  - {error['message']}")
+
+            if validated_response.has_warnings:
+                self.logger.info(
+                    f"Validation warnings: {len(validated_response.warnings)}"
+                )
+
+        return validated_response
 
     def process(self, state: dict) -> dict:
         """Process the input state and generate an answer."""
@@ -204,7 +297,17 @@ class GenerateAnswerNode(BaseNode):
                 )
                 return state
 
-            state.update({self.output[0]: answer})
+            # Apply validation if enabled
+            if self.enable_validation:
+                context = {
+                    "user_prompt": user_prompt,
+                    "schema": self.node_config.get("schema")
+                }
+                validated_answer = self._validate_and_score_response(answer, context)
+                state.update({self.output[0]: validated_answer})
+            else:
+                state.update({self.output[0]: answer})
+
             return state
 
         chains_dict = {}
@@ -263,5 +366,15 @@ class GenerateAnswerNode(BaseNode):
             state.update({self.output[0]: {"error": error_msg, "raw_response": str(e)}})
             return state
 
-        state.update({self.output[0]: answer})
+        # Apply validation if enabled
+        if self.enable_validation:
+            context = {
+                "user_prompt": user_prompt,
+                "schema": self.node_config.get("schema")
+            }
+            validated_answer = self._validate_and_score_response(answer, context)
+            state.update({self.output[0]: validated_answer})
+        else:
+            state.update({self.output[0]: answer})
+
         return state
