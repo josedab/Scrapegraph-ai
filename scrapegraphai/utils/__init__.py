@@ -17,9 +17,16 @@ from .code_error_correction import (
     validation_focused_code_generation,
 )
 from .convert_to_md import convert_to_md
+from .dag_analyzer import DAGAnalyzer
 from .data_export import export_to_csv, export_to_json, export_to_xml
 from .dict_content_compare import are_content_equal
 from .llm_callback_manager import CustomLLMCallbackManager
+from .parallel_executor import (
+    ExecutionMode,
+    ExecutorConfig,
+    NodeExecutionResult,
+    ParallelExecutor,
+)
 from .logging import (
     get_logger,
     get_verbosity,
@@ -96,6 +103,12 @@ __all__ = [
     "select_area_with_opencv",
     "take_screenshot",
     "detect_text",
+    # DAG and parallel execution
+    "DAGAnalyzer",
+    "ParallelExecutor",
+    "ExecutorConfig",
+    "ExecutionMode",
+    "NodeExecutionResult",
     # Logging functions
     "get_logger",
     "get_verbosity",

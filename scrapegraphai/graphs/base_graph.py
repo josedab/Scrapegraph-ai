@@ -61,6 +61,8 @@ class BaseGraph:
         use_burr: bool = False,
         burr_config: dict = None,
         graph_name: str = "Custom",
+        enable_parallel: bool = False,
+        parallel_config: dict = None,
     ):
         self.nodes = nodes
         self.raw_edges = edges
@@ -80,6 +82,30 @@ class BaseGraph:
         self.use_burr = use_burr
         self.burr_config = burr_config or {}
 
+        # NEW: Enhanced DAG representation for parallel execution
+        self.adjacency_list = self._create_adjacency_list(edges)
+        self.reverse_adjacency_list = self._create_reverse_adjacency_list(edges)
+
+        # NEW: Parallel execution configuration
+        self.enable_parallel = enable_parallel
+        self.parallel_config = parallel_config or {}
+
+        # Initialize DAG analyzer if parallel execution enabled
+        if self.enable_parallel:
+            from ..utils.dag_analyzer import DAGAnalyzer
+
+            self.dag_analyzer = DAGAnalyzer(
+                self.adjacency_list, self.reverse_adjacency_list
+            )
+
+            # Validate graph (detect cycles)
+            has_cycle, cycle = self.dag_analyzer.detect_cycles()
+            if has_cycle:
+                raise ValueError(
+                    f"Cannot enable parallel execution: graph contains cycle: "
+                    f"{' → '.join(cycle)}"
+                )
+
     def _create_edges(self, edges: list) -> dict:
         """
         Helper method to create a dictionary of edges from the given iterable of tuples.
@@ -96,6 +122,51 @@ class BaseGraph:
             if from_node.node_type != "conditional_node":
                 edge_dict[from_node.node_name] = to_node.node_name
         return edge_dict
+
+    def _create_adjacency_list(self, edges: list) -> dict:
+        """
+        Create adjacency list representation for DAG analysis.
+
+        This method creates a complete adjacency list that can represent
+        multiple successors per node, enabling proper DAG analysis for
+        parallel execution.
+
+        Args:
+            edges: List of edge tuples (from_node, to_node)
+
+        Returns:
+            dict: {node_name: [successor1, successor2, ...]}
+        """
+        adj_list = {node.node_name: [] for node in self.nodes}
+
+        for from_node, to_node in edges:
+            if to_node is not None:  # Handle terminal nodes
+                if to_node.node_name not in adj_list[from_node.node_name]:
+                    adj_list[from_node.node_name].append(to_node.node_name)
+
+        return adj_list
+
+    def _create_reverse_adjacency_list(self, edges: list) -> dict:
+        """
+        Create reverse adjacency list for dependency tracking.
+
+        This method creates a reverse mapping showing which nodes depend
+        on each node, used for determining when nodes are ready to execute.
+
+        Args:
+            edges: List of edge tuples (from_node, to_node)
+
+        Returns:
+            dict: {node_name: [predecessor1, predecessor2, ...]}
+        """
+        rev_adj_list = {node.node_name: [] for node in self.nodes}
+
+        for from_node, to_node in edges:
+            if to_node is not None:
+                if from_node.node_name not in rev_adj_list[to_node.node_name]:
+                    rev_adj_list[to_node.node_name].append(from_node.node_name)
+
+        return rev_adj_list
 
     def _set_conditional_node_edges(self):
         """
@@ -341,9 +412,191 @@ class BaseGraph:
 
         return state, exec_info
 
+    def _execute_parallel(self, initial_state: dict) -> Tuple[dict, list]:
+        """
+        Execute graph with parallel execution of independent nodes.
+
+        Algorithm:
+        1. Calculate execution levels using DAG analysis
+        2. For each level, execute all nodes in parallel
+        3. Wait for level completion before proceeding
+        4. Aggregate results and update state
+
+        Args:
+            initial_state (dict): The initial state to pass to the entry point node.
+
+        Returns:
+            Tuple[dict, list]: A tuple containing the final state and a list of execution info.
+        """
+        from ..utils.parallel_executor import ParallelExecutor, ExecutorConfig, ExecutionMode
+
+        # Setup
+        state = initial_state
+        total_exec_time = 0.0
+        exec_info = []
+        cb_total = {
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "successful_requests": 0,
+            "total_cost_USD": 0.0,
+        }
+
+        # Get execution levels
+        execution_levels = self.dag_analyzer.calculate_execution_levels()
+
+        # Get metadata (same as sequential)
+        source_type = None
+        llm_model = None
+        llm_model_name = None
+        embedder_model = None
+        source = []
+        prompt = None
+        schema = None
+
+        logger.info(f"Executing graph '{self.graph_name}' with {len(execution_levels)} parallel levels")
+
+        # Create parallel executor
+        mode_str = self.parallel_config.get("mode", "threads")
+        try:
+            mode = ExecutionMode(mode_str)
+        except ValueError:
+            logger.warning(f"Invalid execution mode '{mode_str}', falling back to threads")
+            mode = ExecutionMode.THREADS
+
+        executor_config = ExecutorConfig(
+            mode=mode,
+            max_workers=self.parallel_config.get("max_workers", 4),
+            timeout_per_node=self.parallel_config.get("timeout_per_node"),
+            fail_fast=self.parallel_config.get("fail_fast", True),
+        )
+
+        start_time = time.time()
+        error_node = None
+
+        try:
+            with ParallelExecutor(executor_config) as executor:
+                # Execute each level
+                for level_idx, level_nodes in enumerate(execution_levels):
+                    logger.info(f"Executing level {level_idx}: {level_nodes} ({len(level_nodes)} nodes)")
+
+                    # Get node instances
+                    nodes_to_execute = [
+                        self._get_node_by_name(node_name) for node_name in level_nodes
+                    ]
+
+                    # Extract metadata from first node in level if needed
+                    if len(nodes_to_execute) > 0:
+                        first_node = nodes_to_execute[0]
+
+                        if source_type is None:
+                            source_type, source, prompt = self._update_source_info(
+                                first_node, state
+                            )
+
+                        if llm_model is None:
+                            llm_model, llm_model_name, embedder_model = self._get_model_info(
+                                first_node
+                            )
+
+                        if schema is None:
+                            schema = self._get_schema(first_node)
+
+                    # Execute all nodes in this level in parallel
+                    level_start = time.time()
+                    results = executor.execute_batch(
+                        nodes_to_execute,
+                        self._execute_node,
+                        state,
+                        llm_model,
+                        llm_model_name,
+                    )
+                    level_time = time.time() - level_start
+
+                    logger.info(
+                        f"Level {level_idx} completed in {level_time:.2f}s "
+                        f"({len(results)} nodes executed)"
+                    )
+
+                    # Process results
+                    for result in results:
+                        if not result.success:
+                            error_node = result.node_name
+                            error_msg = str(result.error) if result.error else "Unknown error"
+                            logger.error(f"Node {error_node} failed: {error_msg}")
+                            raise result.error
+
+                        # Update state with node results
+                        # Merge the node's state updates into the main state
+                        state.update(result.state)
+
+                        # Accumulate execution info
+                        total_exec_time += result.exec_time
+                        if result.cb_data:
+                            exec_info.append(result.cb_data)
+                            for key in cb_total:
+                                cb_total[key] += result.cb_data[key]
+
+        except Exception as e:
+            graph_execution_time = time.time() - start_time
+            log_graph_execution(
+                graph_name=self.graph_name,
+                source=source,
+                prompt=prompt,
+                schema=schema,
+                llm_model=llm_model_name,
+                embedder_model=embedder_model,
+                source_type=source_type,
+                execution_time=graph_execution_time,
+                error_node=error_node,
+                exception=str(e),
+            )
+            raise e
+
+        # Add total result summary
+        exec_info.append(
+            {
+                "node_name": "TOTAL RESULT",
+                "total_tokens": cb_total["total_tokens"],
+                "prompt_tokens": cb_total["prompt_tokens"],
+                "completion_tokens": cb_total["completion_tokens"],
+                "successful_requests": cb_total["successful_requests"],
+                "total_cost_USD": cb_total["total_cost_USD"],
+                "exec_time": total_exec_time,
+            }
+        )
+
+        # Success logging
+        graph_execution_time = time.time() - start_time
+        response = state.get("answer", None) if source_type == "url" else None
+        content = state.get("parsed_doc", None) if response is not None else None
+
+        log_graph_execution(
+            graph_name=self.graph_name,
+            source=source,
+            prompt=prompt,
+            schema=schema,
+            llm_model=llm_model_name,
+            embedder_model=embedder_model,
+            source_type=source_type,
+            content=content,
+            response=response,
+            execution_time=graph_execution_time,
+            total_tokens=(
+                cb_total["total_tokens"] if cb_total["total_tokens"] > 0 else None
+            ),
+        )
+
+        logger.info(
+            f"Graph '{self.graph_name}' completed in {graph_execution_time:.2f}s "
+            f"(parallel execution with {len(execution_levels)} levels)"
+        )
+
+        return state, exec_info
+
     def execute(self, initial_state: dict) -> Tuple[dict, list]:
         """
-        Executes the graph by either using BurrBridge or the standard method.
+        Executes the graph by either using BurrBridge, parallel execution, or the standard method.
 
         Args:
             initial_state (dict): The initial state to pass to the entry point node.
@@ -359,6 +612,8 @@ class BaseGraph:
             bridge = BurrBridge(self, self.burr_config)
             result = bridge.execute(initial_state)
             state, exec_info = (result["_state"], [])
+        elif self.enable_parallel:
+            state, exec_info = self._execute_parallel(initial_state)
         else:
             state, exec_info = self._execute_standard(initial_state)
 
