@@ -49,10 +49,11 @@ class CustomCallbackHandler(BaseCallbackHandler):
     successful_requests: int = 0
     total_cost: float = 0.0
 
-    def __init__(self, llm_model_name: str) -> None:
+    def __init__(self, llm_model_name: str, on_token: Optional[callable] = None) -> None:
         super().__init__()
         self._lock = threading.Lock()
         self.model_name = llm_model_name if llm_model_name else "unknown"
+        self.on_token = on_token  # Optional token callback for streaming
 
     def __repr__(self) -> str:
         return (
@@ -75,8 +76,13 @@ class CustomCallbackHandler(BaseCallbackHandler):
         pass
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
-        """Print out the token."""
-        pass
+        """Emit token to callback if provided."""
+        if self.on_token:
+            try:
+                self.on_token(token, {"model": self.model_name})
+            except Exception:
+                # Don't let callback errors break streaming
+                pass
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """Collect token usage."""

@@ -71,6 +71,8 @@ class GenerateAnswerNode(BaseNode):
         self.is_md_scraper = node_config.get("is_md_scraper", False)
         self.additional_info = node_config.get("additional_info")
         self.timeout = node_config.get("timeout", 480)
+        self.streaming_enabled = node_config.get("streaming", False)
+        self.streaming_callback = node_config.get("streaming_callback", None)
 
     def invoke_with_timeout(self, chain, inputs, timeout):
         """Helper method to invoke chain with timeout"""
@@ -85,6 +87,71 @@ class GenerateAnswerNode(BaseNode):
             raise
         except Exception as e:
             self.logger.error(f"Error during chain execution: {str(e)}")
+            raise
+
+    def _extract_token(self, chunk) -> str:
+        """Extract token from streaming chunk."""
+        if isinstance(chunk, str):
+            return chunk
+        elif isinstance(chunk, dict):
+            return chunk.get("content", "")
+        elif hasattr(chunk, "content"):
+            return chunk.content
+        else:
+            return str(chunk)
+
+    def _parse_accumulated_response(self, response: str):
+        """Parse accumulated streaming response."""
+        try:
+            # For JSON responses, parse the complete accumulated text
+            parsed = json.loads(response)
+            return parsed
+        except json.JSONDecodeError:
+            # If not valid JSON, return as-is
+            return response
+
+    def _execute_streaming(self, chain, inputs: dict, state: dict) -> dict:
+        """Execute chain with streaming support."""
+        accumulated_response = ""
+        start_time = time.time()
+
+        try:
+            # Use .stream() instead of .invoke()
+            for chunk in chain.stream(inputs):
+                # Check timeout
+                if time.time() - start_time > self.timeout:
+                    raise Timeout(f"Streaming took longer than {self.timeout} seconds")
+
+                token = self._extract_token(chunk)
+                accumulated_response += token
+
+                # Emit token through callback
+                if self.streaming_callback:
+                    self.streaming_callback(
+                        token=token,
+                        metadata={
+                            "node": self.node_name,
+                            "accumulated": accumulated_response,
+                            "state_key": self.output[0]
+                        }
+                    )
+
+            # Parse final accumulated response if needed
+            # The accumulated response might be JSON that needs parsing
+            try:
+                final_answer = self._parse_accumulated_response(accumulated_response)
+            except Exception:
+                # If parsing fails, use raw accumulated response
+                final_answer = accumulated_response
+
+            state.update({self.output[0]: final_answer})
+            return state
+
+        except Timeout as e:
+            self.logger.error(f"Timeout error during streaming: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error in streaming execution: {str(e)}")
             raise
 
     def process(self, state: dict) -> dict:
@@ -190,9 +257,18 @@ class GenerateAnswerNode(BaseNode):
                 chain = chain | output_parser
 
             try:
-                answer = self.invoke_with_timeout(
-                    chain, {"content": doc, "question": user_prompt}, self.timeout
-                )
+                if self.streaming_enabled:
+                    # Use streaming execution
+                    return self._execute_streaming(
+                        chain, {"content": doc, "question": user_prompt}, state
+                    )
+                else:
+                    # Use non-streaming execution
+                    answer = self.invoke_with_timeout(
+                        chain, {"content": doc, "question": user_prompt}, self.timeout
+                    )
+                    state.update({self.output[0]: answer})
+                    return state
             except (Timeout, json.JSONDecodeError) as e:
                 error_msg = (
                     "Response timeout exceeded"
@@ -203,9 +279,6 @@ class GenerateAnswerNode(BaseNode):
                     {self.output[0]: {"error": error_msg, "raw_response": str(e)}}
                 )
                 return state
-
-            state.update({self.output[0]: answer})
-            return state
 
         chains_dict = {}
         for i, chunk in enumerate(
@@ -225,20 +298,56 @@ class GenerateAnswerNode(BaseNode):
             if output_parser:
                 chains_dict[chain_name] = chains_dict[chain_name] | output_parser
 
-        async_runner = RunnableParallel(**chains_dict)
-        try:
-            batch_results = self.invoke_with_timeout(
-                async_runner, {"question": user_prompt}, self.timeout
-            )
-        except (Timeout, json.JSONDecodeError) as e:
-            error_msg = (
-                "Response timeout exceeded during chunk processing"
-                if isinstance(e, Timeout)
-                else "Invalid JSON response format in chunk processing"
-            )
-            state.update({self.output[0]: {"error": error_msg, "raw_response": str(e)}})
-            return state
+        # Process chunks
+        if self.streaming_enabled:
+            # For streaming, process chunks sequentially
+            batch_results = {}
+            for chain_name, chain in tqdm(chains_dict.items(), desc="Processing chunks", disable=not self.verbose):
+                accumulated = ""
+                start_time = time.time()
+                try:
+                    for chunk in chain.stream({"question": user_prompt}):
+                        if time.time() - start_time > self.timeout:
+                            raise Timeout(f"Chunk processing took longer than {self.timeout} seconds")
 
+                        token = self._extract_token(chunk)
+                        accumulated += token
+
+                        if self.streaming_callback:
+                            self.streaming_callback(
+                                token=token,
+                                metadata={
+                                    "node": self.node_name,
+                                    "chunk": chain_name,
+                                    "phase": "chunk_processing"
+                                }
+                            )
+                    batch_results[chain_name] = self._parse_accumulated_response(accumulated)
+                except (Timeout, json.JSONDecodeError) as e:
+                    error_msg = (
+                        "Response timeout exceeded during chunk processing"
+                        if isinstance(e, Timeout)
+                        else "Invalid JSON response format in chunk processing"
+                    )
+                    state.update({self.output[0]: {"error": error_msg, "raw_response": str(e)}})
+                    return state
+        else:
+            # For non-streaming, use parallel processing
+            async_runner = RunnableParallel(**chains_dict)
+            try:
+                batch_results = self.invoke_with_timeout(
+                    async_runner, {"question": user_prompt}, self.timeout
+                )
+            except (Timeout, json.JSONDecodeError) as e:
+                error_msg = (
+                    "Response timeout exceeded during chunk processing"
+                    if isinstance(e, Timeout)
+                    else "Invalid JSON response format in chunk processing"
+                )
+                state.update({self.output[0]: {"error": error_msg, "raw_response": str(e)}})
+                return state
+
+        # Merge results
         merge_prompt = PromptTemplate(
             template=template_merge_prompt,
             input_variables=["content", "question"],
@@ -248,12 +357,24 @@ class GenerateAnswerNode(BaseNode):
         merge_chain = merge_prompt | self.llm_model
         if output_parser:
             merge_chain = merge_chain | output_parser
+
         try:
-            answer = self.invoke_with_timeout(
-                merge_chain,
-                {"content": batch_results, "question": user_prompt},
-                self.timeout,
-            )
+            if self.streaming_enabled:
+                # Use streaming for merge
+                return self._execute_streaming(
+                    merge_chain,
+                    {"content": batch_results, "question": user_prompt},
+                    state
+                )
+            else:
+                # Use non-streaming for merge
+                answer = self.invoke_with_timeout(
+                    merge_chain,
+                    {"content": batch_results, "question": user_prompt},
+                    self.timeout,
+                )
+                state.update({self.output[0]: answer})
+                return state
         except (Timeout, json.JSONDecodeError) as e:
             error_msg = (
                 "Response timeout exceeded during merge"
@@ -262,6 +383,3 @@ class GenerateAnswerNode(BaseNode):
             )
             state.update({self.output[0]: {"error": error_msg, "raw_response": str(e)}})
             return state
-
-        state.update({self.output[0]: answer})
-        return state

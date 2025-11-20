@@ -63,6 +63,11 @@ class AbstractGraph(ABC):
         self.source = source
         self.config = config
         self.schema = schema
+
+        # Track streaming configuration before creating LLM
+        self._streaming_enabled = config.get("llm", {}).get("streaming", False)
+        self._streaming_callbacks = []
+
         self.llm_model = self._create_llm(config["llm"])
         self.verbose = False if config is None else config.get("verbose", False)
         self.headless = True if self.config is None else config.get("headless", True)
@@ -91,6 +96,8 @@ class AbstractGraph(ABC):
             "llm_model": self.llm_model,
             "cache_path": self.cache_path,
             "timeout": self.timeout,
+            "streaming": self._streaming_enabled,
+            "streaming_callback": None,  # Will be set later when run() is called
         }
 
         self.set_common_params(common_params, overwrite=True)
@@ -128,7 +135,11 @@ class AbstractGraph(ABC):
             KeyError: If the model is not supported.
         """
 
-        llm_defaults = {"streaming": False}
+        # Only use default if user hasn't specified streaming
+        llm_defaults = {}
+        if "streaming" not in llm_config:
+            llm_defaults["streaming"] = False
+
         llm_params = {**llm_defaults, **llm_config}
         rate_limit_params = llm_params.pop("rate_limit", {})
 
@@ -311,6 +322,35 @@ class AbstractGraph(ABC):
 
         return self.execution_info
 
+    def add_streaming_callback(self, callback: callable) -> None:
+        """
+        Add a callback to receive streaming tokens.
+
+        Args:
+            callback: Function called with each token. Signature: callback(token: str, metadata: dict)
+        """
+        self._streaming_callbacks.append(callback)
+
+    def _emit_token(self, token: str, metadata: dict = None) -> None:
+        """
+        Emit token to all registered callbacks.
+
+        Args:
+            token: The token to emit
+            metadata: Optional metadata about the token
+        """
+        for callback in self._streaming_callbacks:
+            try:
+                callback(token, metadata or {})
+            except Exception as e:
+                logger.error(f"Error in streaming callback: {e}")
+
+    def _create_streaming_callback(self):
+        """Create callback that emits to all registered callbacks."""
+        def callback(token: str, metadata: dict):
+            self._emit_token(token, metadata)
+        return callback
+
     @abstractmethod
     def _create_graph(self):
         """
@@ -322,6 +362,13 @@ class AbstractGraph(ABC):
         """
         Abstract method to execute the graph and return the result.
         """
+        # Setup streaming callback if enabled
+        if self._streaming_enabled:
+            streaming_callback = self._create_streaming_callback()
+            # Update nodes with streaming callback
+            for node in self.graph.nodes:
+                node.update_config({"streaming_callback": streaming_callback}, overwrite=True)
+
         inputs = {"user_prompt": self.prompt, self.input_key: self.source}
         self.final_state, self.execution_info = self.graph.execute(inputs)
         result = self.final_state.get("answer", "No answer found.")
