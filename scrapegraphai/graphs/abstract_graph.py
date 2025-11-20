@@ -17,6 +17,11 @@ from ..helpers import models_tokens
 from ..models import CLoD, DeepSeek, OneApi, XAI
 from ..utils.logging import set_verbosity_info, set_verbosity_warning, get_logger
 from ..telemetry import log_graph_execution
+from ..resilience import (
+    CircuitBreaker,
+    ResilientLLMProvider,
+    LLMProviderManager,
+)
 
 logger = get_logger(__name__)
 
@@ -63,7 +68,7 @@ class AbstractGraph(ABC):
         self.source = source
         self.config = config
         self.schema = schema
-        self.llm_model = self._create_llm(config["llm"])
+        self.llm_model = self._create_llm_manager(config["llm"])
         self.verbose = False if config is None else config.get("verbose", False)
         self.headless = True if self.config is None else config.get("headless", True)
         self.loader_kwargs = self.config.get("loader_kwargs", {})
@@ -275,6 +280,125 @@ class AbstractGraph(ABC):
 
         except Exception as e:
             raise Exception(f"Error instancing model: {e}")
+
+    def _create_llm_manager(self, llm_config: dict) -> object:
+        """
+        Create LLM provider manager with fallback support.
+
+        This method creates an LLM provider manager that can automatically
+        fall back to alternative providers if the primary fails. If fallback
+        is not enabled in the configuration, it returns a simple provider
+        manager with only the primary provider for backward compatibility.
+
+        Args:
+            llm_config (dict): Configuration parameters for the language model,
+                              optionally including fallback configuration.
+
+        Returns:
+            object: LLMProviderManager instance or a simple wrapper for backward compatibility
+
+        Example:
+            Configuration with fallback:
+            {
+                "model": "gpt-4",
+                "model_provider": "openai",
+                "fallback": {
+                    "enabled": True,
+                    "providers": [
+                        {
+                            "model": "claude-3-sonnet",
+                            "model_provider": "anthropic",
+                            "priority": 1
+                        }
+                    ],
+                    "circuit_breaker": {
+                        "failure_threshold": 5,
+                        "success_threshold": 2,
+                        "timeout": 60
+                    },
+                    "retry": {
+                        "max_attempts": 3,
+                        "exponential_backoff": True
+                    }
+                }
+            }
+        """
+        fallback_config = llm_config.get("fallback", {})
+
+        # Check if fallback is enabled
+        if not fallback_config.get("enabled", False):
+            # Backward compatibility: single provider without resilience features
+            llm = self._create_llm(llm_config)
+            # Wrap in a simple manager that always uses the single provider
+            primary = ResilientLLMProvider(
+                provider=llm,
+                circuit_breaker=CircuitBreaker(
+                    failure_threshold=999999  # Effectively disable circuit breaker
+                ),
+                name=f"{llm_config.get('model_provider', 'unknown')}/{llm_config.get('model', 'unknown')}"
+            )
+            return LLMProviderManager(
+                primary=primary,
+                fallback_enabled=False
+            )
+
+        # Extract circuit breaker configuration
+        cb_config = fallback_config.get("circuit_breaker", {})
+
+        # Create primary provider with circuit breaker
+        primary_llm = self._create_llm(llm_config)
+        primary = ResilientLLMProvider(
+            provider=primary_llm,
+            circuit_breaker=CircuitBreaker(
+                failure_threshold=cb_config.get("failure_threshold", 5),
+                success_threshold=cb_config.get("success_threshold", 2),
+                timeout=cb_config.get("timeout", 60),
+                half_open_max_calls=cb_config.get("half_open_max_calls", 1)
+            ),
+            name=f"{llm_config.get('model_provider', 'primary')}/{llm_config.get('model', 'unknown')}",
+            priority=0
+        )
+
+        # Create fallback providers
+        fallbacks = []
+        for fb_config in fallback_config.get("providers", []):
+            # Merge primary config with fallback config (fallback takes precedence)
+            merged_config = {**llm_config, **fb_config}
+            # Remove fallback key from merged config to avoid recursion
+            merged_config.pop("fallback", None)
+
+            try:
+                fallback_llm = self._create_llm(merged_config)
+                fallback_provider = ResilientLLMProvider(
+                    provider=fallback_llm,
+                    circuit_breaker=CircuitBreaker(
+                        failure_threshold=cb_config.get("failure_threshold", 5),
+                        success_threshold=cb_config.get("success_threshold", 2),
+                        timeout=cb_config.get("timeout", 60),
+                        half_open_max_calls=cb_config.get("half_open_max_calls", 1)
+                    ),
+                    name=f"{fb_config.get('model_provider', 'fallback')}/{fb_config.get('model', 'unknown')}",
+                    priority=fb_config.get("priority", 999)
+                )
+                fallbacks.append(fallback_provider)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize fallback provider "
+                    f"{fb_config.get('model_provider')}/{fb_config.get('model')}: {e}"
+                )
+                # Continue with other fallback providers
+
+        # Sort fallbacks by priority
+        fallbacks.sort(key=lambda x: x.priority)
+
+        # Create and return the provider manager
+        return LLMProviderManager(
+            primary=primary,
+            fallbacks=fallbacks,
+            retry_config=fallback_config.get("retry", {}),
+            health_check_config=fallback_config.get("health_check", {}),
+            fallback_enabled=True
+        )
 
     def get_state(self, key=None) -> dict:
         """ ""
