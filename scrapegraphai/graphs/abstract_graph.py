@@ -7,16 +7,17 @@ import uuid
 import warnings
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Type
+from typing import Optional, Type, Union
 
 from langchain.chat_models import init_chat_model
 from langchain_core.rate_limiters import InMemoryRateLimiter
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ..helpers import models_tokens
 from ..models import CLoD, DeepSeek, OneApi, XAI
 from ..utils.logging import set_verbosity_info, set_verbosity_warning, get_logger
 from ..telemetry import log_graph_execution
+from ..config import BaseGraphConfig, ConfigurationError
 
 logger = get_logger(__name__)
 
@@ -29,7 +30,7 @@ class AbstractGraph(ABC):
 
         prompt (str): The prompt for the graph.
         source (str): The source of the graph.
-        config (dict): Configuration parameters for the graph.
+        config (Union[dict, BaseGraphConfig]): Configuration parameters for the graph.
         schema (BaseModel): The schema for the graph output.
         llm_model: An instance of a language model client, configured for generating answers.
         verbose (bool): A flag indicating whether to show print statements during execution.
@@ -37,7 +38,7 @@ class AbstractGraph(ABC):
 
     Args:
         prompt (str): The prompt for the graph.
-        config (dict): Configuration parameters for the graph.
+        config (Union[dict, BaseGraphConfig]): Configuration parameters for the graph.
         source (str, optional): The source of the graph.
         schema (str, optional): The schema for the graph output.
 
@@ -55,31 +56,48 @@ class AbstractGraph(ABC):
     def __init__(
         self,
         prompt: str,
-        config: dict,
+        config: Union[dict, BaseGraphConfig],
         source: Optional[str] = None,
         schema: Optional[Type[BaseModel]] = None,
     ):
         self.prompt = prompt
         self.source = source
-        self.config = config
+
+        # Convert dict to Pydantic model with validation
+        if isinstance(config, dict):
+            try:
+                self.config = BaseGraphConfig(**config)
+            except ValidationError as e:
+                raise ConfigurationError(
+                    f"Invalid configuration:\n{self._format_validation_error(e)}",
+                    suggestions=[
+                        "Ensure all required fields are present (e.g., 'llm')",
+                        "Check that field types are correct",
+                        "See documentation: https://docs.scrapegraphai.com/config"
+                    ]
+                ) from e
+        else:
+            self.config = config
+
         self.schema = schema
-        self.llm_model = self._create_llm(config["llm"])
-        self.verbose = False if config is None else config.get("verbose", False)
-        self.headless = True if self.config is None else config.get("headless", True)
-        self.loader_kwargs = self.config.get("loader_kwargs", {})
-        self.cache_path = self.config.get("cache_path", False)
-        self.browser_base = self.config.get("browser_base")
-        self.scrape_do = self.config.get("scrape_do")
-        self.storage_state = self.config.get("storage_state")
-        self.timeout = self.config.get("timeout", 480)
+
+        # Access validated configuration - convert to dict for _create_llm
+        llm_config_dict = self.config.llm.model_dump(exclude_none=True)
+        self.llm_model = self._create_llm(llm_config_dict)
+        self.verbose = self.config.verbose
+        self.headless = self.config.headless
+        self.loader_kwargs = self.config.loader_kwargs
+        self.cache_path = self.config.cache_path
+        self.browser_base = self.config.browser_base
+        self.scrape_do = self.config.scrape_do
+        self.storage_state = self.config.storage_state
+        self.timeout = self.config.timeout
 
         self.graph = self._create_graph()
         self.final_state = None
         self.execution_info = None
 
-        verbose = bool(config and config.get("verbose"))
-
-        if verbose:
+        if self.verbose:
             set_verbosity_info()
         else:
             set_verbosity_warning()
@@ -95,13 +113,31 @@ class AbstractGraph(ABC):
 
         self.set_common_params(common_params, overwrite=True)
 
-        self.burr_kwargs = config.get("burr_kwargs", None)
+        self.burr_kwargs = self.config.burr_kwargs
         if self.burr_kwargs is not None:
             self.graph.use_burr = True
             if "app_instance_id" not in self.burr_kwargs:
                 self.burr_kwargs["app_instance_id"] = str(uuid.uuid4())
 
             self.graph.burr_config = self.burr_kwargs
+
+    @staticmethod
+    def _format_validation_error(error: ValidationError) -> str:
+        """
+        Format Pydantic validation errors for user-friendly display.
+
+        Args:
+            error: The Pydantic ValidationError to format
+
+        Returns:
+            Formatted error message with field locations and descriptions
+        """
+        messages = []
+        for err in error.errors():
+            field = ".".join(str(x) for x in err["loc"])
+            message = err["msg"]
+            messages.append(f"  - {field}: {message}")
+        return "\n".join(messages)
 
     def set_common_params(self, params: dict, overwrite=False):
         """
