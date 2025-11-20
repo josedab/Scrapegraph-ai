@@ -19,6 +19,20 @@ from .code_error_correction import (
 from .convert_to_md import convert_to_md
 from .data_export import export_to_csv, export_to_json, export_to_xml
 from .dict_content_compare import are_content_equal
+from .error_context import (
+    ErrorContext,
+    ErrorContextCapture,
+    ErrorContextManager,
+    ScrapingException,
+)
+from .retry_policy import (
+    AGGRESSIVE_RETRY_POLICY,
+    DEFAULT_RETRY_POLICY,
+    NO_RETRY_POLICY,
+    ErrorCategory,
+    RetryPolicy,
+    RetryStrategy,
+)
 from .llm_callback_manager import CustomLLMCallbackManager
 from .logging import (
     get_logger,
@@ -81,6 +95,17 @@ __all__ = [
     "are_content_equal",
     "CustomLLMCallbackManager",
     "prettify_exec_info",
+    # Error context and retry policy
+    "ErrorContext",
+    "ErrorContextCapture",
+    "ErrorContextManager",
+    "ScrapingException",
+    "RetryPolicy",
+    "RetryStrategy",
+    "ErrorCategory",
+    "DEFAULT_RETRY_POLICY",
+    "AGGRESSIVE_RETRY_POLICY",
+    "NO_RETRY_POLICY",
     "transform_schema",
     "split_text_into_chunks",
     "dynamic_import",

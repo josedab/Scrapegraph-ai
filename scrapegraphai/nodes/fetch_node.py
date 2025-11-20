@@ -87,6 +87,26 @@ class FetchNode(BaseNode):
             None if node_config is None else node_config.get("storage_state", None)
         )
 
+        # Error context configuration
+        self.capture_error_context = (
+            True if node_config is None else node_config.get("capture_error_context", True)
+        )
+
+        self.error_artifacts_dir = (
+            "./error_artifacts"
+            if node_config is None
+            else node_config.get("error_artifacts_dir", "./error_artifacts")
+        )
+
+        # Retry policy configuration
+        retry_config = {} if node_config is None else node_config.get("retry_policy", {})
+        if retry_config:
+            from ..utils.retry_policy import RetryPolicy
+            self.retry_policy = RetryPolicy(**retry_config) if isinstance(retry_config, dict) else retry_config
+        else:
+            from ..utils.retry_policy import DEFAULT_RETRY_POLICY
+            self.retry_policy = DEFAULT_RETRY_POLICY
+
     def execute(self, state):
         """
         Executes the node's logic to fetch HTML content from a specified URL and
@@ -352,13 +372,35 @@ class FetchNode(BaseNode):
 
                 document = [Document(page_content=data, metadata={"source": source})]
             else:
+                # Pass error context configuration to ChromiumLoader
                 loader = ChromiumLoader(
                     [source],
                     headless=self.headless,
                     storage_state=self.storage_state,
+                    retry_policy=self.retry_policy,
+                    capture_error_context=self.capture_error_context,
+                    error_artifacts_dir=self.error_artifacts_dir,
                     **loader_kwargs,
                 )
-                document = loader.load()
+
+                try:
+                    document = loader.load()
+                except Exception as e:
+                    # Import here to avoid circular dependencies
+                    from ..utils.error_context import ScrapingException
+
+                    # Handle ScrapingException with enhanced context
+                    if isinstance(e, ScrapingException):
+                        self.logger.error(f"Scraping failed: {e}")
+
+                        if e.context and e.context.screenshot_path:
+                            self.logger.error(f"Screenshot saved: {e.context.screenshot_path}")
+
+                        # Attach context to state for debugging
+                        state["error_context"] = e.context
+
+                    # Re-raise the exception
+                    raise
 
             if not document or not document[0].page_content.strip():
                 raise ValueError(

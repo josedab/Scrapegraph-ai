@@ -37,6 +37,9 @@ class ChromiumLoader(BaseLoader):
         browser_name: str = "chromium",  # default chromium
         retry_limit: int = 1,
         timeout: int = 60,
+        retry_policy=None,
+        capture_error_context: bool = True,
+        error_artifacts_dir: str = "./error_artifacts",
         **kwargs: Any,
     ):
         """Initialize the loader with a list of URL paths.
@@ -72,6 +75,17 @@ class ChromiumLoader(BaseLoader):
         self.browser_name = kwargs.get("browser_name", browser_name)
         self.retry_limit = kwargs.get("retry_limit", retry_limit)
         self.timeout = kwargs.get("timeout", timeout)
+
+        # Error context configuration
+        self.capture_error_context = capture_error_context
+        self.error_artifacts_dir = error_artifacts_dir
+
+        # Retry policy - import here to avoid circular imports
+        if retry_policy is None and capture_error_context:
+            from ..utils.retry_policy import DEFAULT_RETRY_POLICY
+            self.retry_policy = DEFAULT_RETRY_POLICY
+        else:
+            self.retry_policy = retry_policy
 
     async def scrape(self, url: str) -> str:
         if self.backend == "playwright":
@@ -338,46 +352,138 @@ class ChromiumLoader(BaseLoader):
         from undetected_playwright import Malenia
 
         logger.info(f"Starting scraping with {self.backend}...")
-        results = ""
-        attempt = 0
 
-        while attempt < self.retry_limit:
-            try:
-                async with async_playwright() as p, async_timeout.timeout(self.timeout):
+        # Use error context manager if enabled
+        if self.capture_error_context and self.retry_policy:
+            from ..utils.error_context import ErrorContextManager, ScrapingException
+
+            # Configure error context capture
+            capture_config = {
+                "capture_screenshot": self.capture_error_context,
+                "capture_html": self.capture_error_context,
+                "capture_console": self.capture_error_context,
+                "capture_network": self.capture_error_context,
+                "capture_storage": self.capture_error_context,
+                "save_to_disk": self.capture_error_context,
+                "output_dir": self.error_artifacts_dir,
+            }
+
+            error_manager = ErrorContextManager(
+                retry_policy=self.retry_policy,
+                capture_config=capture_config,
+                on_retry=self._on_retry,
+                on_failure=self._on_failure,
+            )
+
+            async def scrape_operation():
+                async with async_playwright() as p:
                     browser = None
-                    if browser_name == "chromium":
-                        browser = await p.chromium.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
+                    try:
+                        if browser_name == "chromium":
+                            browser = await p.chromium.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        elif browser_name == "firefox":
+                            browser = await p.firefox.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        else:
+                            raise ValueError(f"Invalid browser name: {browser_name}")
+
+                        context = await browser.new_context(
+                            storage_state=self.storage_state,
+                            ignore_https_errors=True,
                         )
-                    elif browser_name == "firefox":
-                        browser = await p.firefox.launch(
-                            headless=self.headless,
-                            proxy=self.proxy,
-                            **self.browser_config,
+                        await Malenia.apply_stealth(context)
+                        page = await context.new_page()
+
+                        # Set up error context capture with the page
+                        error_manager.set_page(page, url)
+
+                        # Navigate and scrape
+                        await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+                        await page.wait_for_load_state(self.load_state)
+                        results = await page.content()
+
+                        # Validate results
+                        if not results or not results.strip():
+                            raise ValueError("No HTML content returned from page")
+
+                        logger.info("Content scraped successfully")
+                        return results
+
+                    finally:
+                        if browser:
+                            await browser.close()
+
+            # Execute with retry logic
+            try:
+                return await error_manager.execute_with_retry(scrape_operation, url)
+            except ScrapingException:
+                raise
+            except Exception as e:
+                # Wrap other exceptions
+                raise RuntimeError(f"Scraping failed: {str(e)}") from e
+
+        else:
+            # Original implementation without error context
+            results = ""
+            attempt = 0
+
+            while attempt < self.retry_limit:
+                try:
+                    async with async_playwright() as p, async_timeout.timeout(self.timeout):
+                        browser = None
+                        if browser_name == "chromium":
+                            browser = await p.chromium.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        elif browser_name == "firefox":
+                            browser = await p.firefox.launch(
+                                headless=self.headless,
+                                proxy=self.proxy,
+                                **self.browser_config,
+                            )
+                        else:
+                            raise ValueError(f"Invalid browser name: {browser_name}")
+                        context = await browser.new_context(
+                            storage_state=self.storage_state,
+                            ignore_https_errors=True,
                         )
-                    else:
-                        raise ValueError(f"Invalid browser name: {browser_name}")
-                    context = await browser.new_context(
-                        storage_state=self.storage_state,
-                        ignore_https_errors=True,
-                    )
-                    await Malenia.apply_stealth(context)
-                    page = await context.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
-                    await page.wait_for_load_state(self.load_state)
-                    results = await page.content()
-                    logger.info("Content scraped")
-                    await browser.close()
-                    return results
-            except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
-                attempt += 1
-                logger.error(f"Attempt {attempt} failed: {e}")
-                if attempt == self.retry_limit:
-                    raise RuntimeError(
-                        f"Failed to scrape after {self.retry_limit} attempts: {str(e)}"
-                    )
+                        await Malenia.apply_stealth(context)
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded")
+                        await page.wait_for_load_state(self.load_state)
+                        results = await page.content()
+                        logger.info("Content scraped")
+                        await browser.close()
+                        return results
+                except (aiohttp.ClientError, asyncio.TimeoutError, Exception) as e:
+                    attempt += 1
+                    logger.error(f"Attempt {attempt} failed: {e}")
+                    if attempt == self.retry_limit:
+                        raise RuntimeError(
+                            f"Failed to scrape after {self.retry_limit} attempts: {str(e)}"
+                        )
+
+    def _on_retry(self, attempt: int, error: Exception, context) -> None:
+        """Callback when a retry is about to happen."""
+        logger.warning(
+            f"Retry {attempt}/{self.retry_policy.max_attempts} after error: {error}"
+        )
+        if context.screenshot_path:
+            logger.info(f"Error screenshot saved to: {context.screenshot_path}")
+
+    def _on_failure(self, error: Exception, context) -> None:
+        """Callback when all retries are exhausted."""
+        logger.error("Scraping failed after all retries")
+        logger.error(f"Error context:\n{context.get_summary()}")
 
     async def ascrape_with_js_support(
         self, url: str, browser_name: str = "chromium"
